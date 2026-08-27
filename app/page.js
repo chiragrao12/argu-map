@@ -3,9 +3,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { CommandDialog, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from '@/components/ui/dialog';
+import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
 import { Toaster } from '@/components/ui/sonner';
-import { Brain, Network, FileText, Share2, ListChecks, Plus, PanelRightClose, PanelRightOpen, Sparkles, Flag, CheckCircle2, AlertTriangle, ListTodo } from 'lucide-react';
+import { Brain, Network, FileText, Share2, ListChecks, Plus, PanelRightClose, PanelRightOpen, Sparkles, Flag, CheckCircle2, AlertTriangle, ListTodo, Search, Wand2, Loader2 } from 'lucide-react';
 import CanvasView from '@/components/scaffold/CanvasView';
 import GraphView from '@/components/scaffold/GraphView';
 import NotesView from '@/components/scaffold/NotesView';
@@ -62,6 +65,11 @@ function App() {
   const [editorNode, setEditorNode] = useState(null);
   const [editorOpen, setEditorOpen] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [focusNodeId, setFocusNodeId] = useState(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [structOpen, setStructOpen] = useState(false);
+  const [structText, setStructText] = useState('');
+  const [structBusy, setStructBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -79,6 +87,50 @@ function App() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setSearchOpen((o) => !o);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
+  const jumpToNode = useCallback((node) => {
+    setSearchOpen(false);
+    setSelectedId(node.id);
+    if (node.type === 'note') setView('notes');
+    else if (node.type === 'task') setView('timeline');
+    else {
+      setView('canvas');
+      setFocusNodeId(null);
+      setTimeout(() => setFocusNodeId(node.id), 50);
+    }
+  }, []);
+
+  const runStructure = useCallback(async () => {
+    if (!structText.trim()) return;
+    setStructBusy(true);
+    try {
+      const res = await api.post('ai/structure', { text: structText });
+      if (res?.ok) {
+        await refresh();
+        setView('canvas');
+        setStructOpen(false);
+        setStructText('');
+        if (res.claim_id) setTimeout(() => setFocusNodeId(res.claim_id), 100);
+        toast.success(`Structured: 1 claim, ${res.premises} premises${res.objections ? ', ' + res.objections + ' objections' : ''}`);
+      } else {
+        toast.error(res?.error || 'Could not structure text');
+      }
+    } catch (e) {
+      toast.error('Structure failed: ' + e.message);
+    }
+    setStructBusy(false);
+  }, [structText, refresh]);
 
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
 
@@ -169,6 +221,13 @@ function App() {
         </nav>
 
         <div className="ml-auto flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={() => setSearchOpen(true)} className="text-muted-foreground">
+            <Search className="h-4 w-4 mr-1" /> Search
+            <kbd className="ml-2 hidden md:inline text-[10px] bg-muted px-1.5 py-0.5 rounded border border-border">⌘K</kbd>
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setStructOpen(true)}>
+            <Wand2 className="h-4 w-4 mr-1" /> AI Structure
+          </Button>
           <Button variant="outline" size="sm" onClick={seedDemo}>
             <Sparkles className="h-4 w-4 mr-1" /> Demo
           </Button>
@@ -206,6 +265,7 @@ function App() {
                 onUpdatePosition={updatePosition}
                 onEditNode={onEditNode}
                 onDeleteNode={deleteNode}
+                focusNodeId={focusNodeId}
               />
             </div>
           )}
@@ -226,6 +286,49 @@ function App() {
       </div>
 
       <NodeEditor node={editorNode} open={editorOpen} onOpenChange={setEditorOpen} onSave={updateNode} />
+
+      <CommandDialog open={searchOpen} onOpenChange={setSearchOpen}>
+        <CommandInput placeholder="Search notes, claims, tasks…" />
+        <CommandList>
+          <CommandEmpty>No matches found.</CommandEmpty>
+          {['claim', 'premise', 'objection', 'note', 'task'].map((type) => {
+            const items = nodes.filter((n) => n.type === type);
+            if (!items.length) return null;
+            const label = { claim: 'Claims', premise: 'Premises', objection: 'Objections', note: 'Notes', task: 'Tasks' }[type];
+            return (
+              <CommandGroup key={type} heading={label}>
+                {items.map((n) => (
+                  <CommandItem key={n.id} value={`${n.outline_number || ''} ${n.title} ${n.content || ''}`} onSelect={() => jumpToNode(n)}>
+                    {n.outline_number && <span className="mr-2 font-mono text-xs text-muted-foreground">[{n.outline_number}]</span>}
+                    <span className="truncate">{n.title}</span>
+                  </CommandItem>
+                ))}
+              </CommandGroup>
+            );
+          })}
+        </CommandList>
+      </CommandDialog>
+
+      <Dialog open={structOpen} onOpenChange={setStructOpen}>
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><Wand2 className="h-4 w-4 text-emerald-400" /> AI Auto-Structure</DialogTitle>
+            <DialogDescription>Paste a rough paragraph. The AI extracts a claim, its supporting premises, and any objections — then lays them out on the canvas.</DialogDescription>
+          </DialogHeader>
+          <Textarea
+            value={structText}
+            onChange={(e) => setStructText(e.target.value)}
+            placeholder="e.g. Remote work boosts productivity because people avoid commutes and control their environment, though some argue it hurts collaboration…"
+            className="min-h-[160px] text-sm"
+          />
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setStructOpen(false)} disabled={structBusy}>Cancel</Button>
+            <Button onClick={runStructure} disabled={structBusy || !structText.trim()}>
+              {structBusy ? <><Loader2 className="h-4 w-4 mr-1 animate-spin" /> Structuring…</> : <>Build argument map</>}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

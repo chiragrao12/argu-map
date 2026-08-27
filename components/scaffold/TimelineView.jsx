@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { STATUS_META } from './constants';
-import { ArrowRight, Plus, Trash2 } from 'lucide-react';
+import { ArrowRight, Plus, Trash2, AlertTriangle, Clock } from 'lucide-react';
 
 export default function TimelineView({ nodes, edges, onCreate, onUpdate, onDelete, onCreateEdge }) {
   const tasks = useMemo(() => nodes.filter((n) => n.type === 'task'), [nodes]);
@@ -43,6 +43,15 @@ export default function TimelineView({ nodes, edges, onCreate, onUpdate, onDelet
     if (step?.id) await onCreateEdge({ source_id: task.id, target_id: step.id, relation: 'follow_up' });
   };
 
+  const reminders = useMemo(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    const in7 = new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10);
+    const due = tasks.filter((t) => t.due_date && t.status !== 'done');
+    const overdue = due.filter((t) => t.due_date < today).sort((a, b) => a.due_date.localeCompare(b.due_date));
+    const upcoming = due.filter((t) => t.due_date >= today && t.due_date <= in7).sort((a, b) => a.due_date.localeCompare(b.due_date));
+    return { overdue, upcoming };
+  }, [tasks]);
+
   return (
     <div className="h-full overflow-auto p-6 space-y-8">
       <div className="flex items-center justify-between">
@@ -54,6 +63,45 @@ export default function TimelineView({ nodes, edges, onCreate, onUpdate, onDelet
           <Plus className="h-4 w-4 mr-1" /> New chain
         </Button>
       </div>
+
+      {(reminders.overdue.length > 0 || reminders.upcoming.length > 0) && (
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="rounded-lg border border-red-500/40 bg-red-500/5 p-3">
+            <div className="flex items-center gap-2 text-sm font-semibold text-red-400 mb-2">
+              <AlertTriangle className="h-4 w-4" /> Overdue ({reminders.overdue.length})
+            </div>
+            {reminders.overdue.length ? (
+              <ul className="space-y-1">
+                {reminders.overdue.map((t) => (
+                  <li key={t.id} className="text-sm flex items-center justify-between gap-2">
+                    <span className="truncate">{t.title}</span>
+                    <span className="text-xs text-red-400 shrink-0">{t.due_date}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-muted-foreground">Nothing overdue. Nice.</p>
+            )}
+          </div>
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
+            <div className="flex items-center gap-2 text-sm font-semibold text-amber-400 mb-2">
+              <Clock className="h-4 w-4" /> Due in 7 days ({reminders.upcoming.length})
+            </div>
+            {reminders.upcoming.length ? (
+              <ul className="space-y-1">
+                {reminders.upcoming.map((t) => (
+                  <li key={t.id} className="text-sm flex items-center justify-between gap-2">
+                    <span className="truncate">{t.title}</span>
+                    <span className="text-xs text-amber-400 shrink-0">{t.due_date}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="text-xs text-muted-foreground">Nothing due this week.</p>
+            )}
+          </div>
+        </div>
+      )}
 
       {!chains.length && <p className="text-sm text-muted-foreground">No tasks yet. Create a chain to get started.</p>}
 

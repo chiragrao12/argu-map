@@ -145,7 +145,100 @@ export async function POST(request) {
           );
         }
       }
+      // Auto joint-grouping: all "supports" edges pointing at the same claim form one joint trunk.
+      if (relation === 'supports' && !edge.joint_group_id) {
+        const siblings = await db
+          .collection('edges')
+          .find({ workspace_id: WS, relation: 'supports', target_id: body.target_id })
+          .toArray();
+        if (siblings.length > 1) {
+          const gid = siblings.find((s) => s.joint_group_id)?.joint_group_id || uuidv4();
+          await db
+            .collection('edges')
+            .updateMany({ workspace_id: WS, relation: 'supports', target_id: body.target_id }, { $set: { joint_group_id: gid } });
+          edge.joint_group_id = gid;
+        }
+      }
       return json(edge);
+    }
+
+    if (parts[0] === 'ai' && parts[1] === 'structure') {
+      const text = (body.text || '').trim();
+      if (!text) return json({ error: 'No text provided' }, 400);
+      const system =
+        'You are an argument-mapping assistant. Given a rough paragraph, extract its core CLAIM, the PREMISES that support it, and any OBJECTIONS present. Respond in STRICT JSON only (no markdown, no prose): {"claim":{"title":"<=10 words","content":"one sentence"},"premises":[{"title":"<=10 words","content":"one sentence"}],"objections":[{"title":"<=10 words","content":"one sentence"}]}. Provide 2 to 4 premises. Objections may be an empty array.';
+      const raw = await chat(system, text, 1000);
+      let data;
+      try {
+        const m = raw.match(/\{[\s\S]*\}/);
+        data = JSON.parse(m ? m[0] : raw);
+      } catch (_) {
+        return json({ error: 'Could not parse AI output', raw }, 502);
+      }
+      const now = () => new Date().toISOString();
+      const baseNode = (o) => ({
+        workspace_id: WS,
+        title: 'Untitled',
+        content: '',
+        type: 'note',
+        status: null,
+        due_date: null,
+        outline_number: null,
+        parent_id: null,
+        position: { x: 0, y: 0 },
+        color: null,
+        created_at: now(),
+        updated_at: now(),
+        ...o,
+      });
+      const claim = baseNode({
+        id: uuidv4(),
+        type: 'claim',
+        title: data.claim?.title || 'Claim',
+        content: data.claim?.content || '',
+        outline_number: await computeOutline(db, null),
+        position: { x: 540, y: 80 },
+      });
+      await db.collection('nodes').insertOne({ ...claim });
+      const premises = Array.isArray(data.premises) ? data.premises.slice(0, 4) : [];
+      const objections = Array.isArray(data.objections) ? data.objections.slice(0, 3) : [];
+      const jg = premises.length > 1 ? uuidv4() : null;
+      const createdEdges = [];
+      let px = 180;
+      for (const p of premises) {
+        const node = baseNode({
+          id: uuidv4(),
+          type: 'premise',
+          title: p.title || 'Premise',
+          content: p.content || '',
+          parent_id: claim.id,
+          outline_number: await computeOutline(db, claim.id),
+          position: { x: px, y: 360 },
+        });
+        await db.collection('nodes').insertOne({ ...node });
+        const e = { id: uuidv4(), workspace_id: WS, source_id: node.id, target_id: claim.id, relation: 'supports', joint_group_id: jg, style: 'solid' };
+        await db.collection('edges').insertOne({ ...e });
+        createdEdges.push(e);
+        px += 280;
+      }
+      let ox = px + 40;
+      for (const o of objections) {
+        const node = baseNode({
+          id: uuidv4(),
+          type: 'objection',
+          color: 'amber',
+          title: o.title || 'Objection',
+          content: o.content || '',
+          parent_id: claim.id,
+          outline_number: await computeOutline(db, claim.id),
+          position: { x: ox, y: 360 },
+        });
+        await db.collection('nodes').insertOne({ ...node });
+        const e = { id: uuidv4(), workspace_id: WS, source_id: node.id, target_id: claim.id, relation: 'objects_to', joint_group_id: null, style: 'dashed' };
+        await db.collection('edges').insertOne({ ...e });
+        ox += 280;
+      }
+      return json({ ok: true, claim_id: claim.id, premises: premises.length, objections: objections.length });
     }
 
     if (parts[0] === 'ai' && parts[1] === 'chat') {

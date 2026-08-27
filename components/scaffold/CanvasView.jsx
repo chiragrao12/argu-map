@@ -10,8 +10,10 @@ import {
   MiniMap,
   applyNodeChanges,
   MarkerType,
+  useReactFlow,
 } from '@xyflow/react';
 import ScaffoldNode from './ScaffoldNode';
+import JointSupportEdge from './JointSupportEdge';
 import { RELATIONS } from './constants';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
@@ -26,10 +28,11 @@ function edgeStyle(relation, joint) {
   return { stroke: '#64748b', strokeWidth: 1.5 };
 }
 
-function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDeleteNode }) {
+function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDeleteNode, focusNodeId }) {
   const [rfNodes, setRfNodes] = useState([]);
   const [pending, setPending] = useState(null);
   const [relation, setRelation] = useState('supports');
+  const { setCenter } = useReactFlow();
 
   const toRf = useCallback(
     (n) => ({
@@ -45,25 +48,63 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
     setRfNodes(nodes.map(toRf));
   }, [nodes, toRf]);
 
+  // Center the viewport on a node when a search result is picked.
+  useEffect(() => {
+    if (!focusNodeId) return;
+    const n = nodes.find((x) => x.id === focusNodeId);
+    if (n?.position) setCenter(n.position.x + 112, n.position.y + 60, { zoom: 1.15, duration: 600 });
+  }, [focusNodeId, nodes, setCenter]);
+
   const onNodesChange = useCallback((chs) => setRfNodes((nds) => applyNodeChanges(chs, nds)), []);
   const onNodeDragStop = useCallback((_e, node) => onUpdatePosition(node.id, node.position), [onUpdatePosition]);
 
-  const rfEdges = useMemo(
-    () =>
-      edges.map((e) => ({
+  const rfEdges = useMemo(() => {
+    const posById = {};
+    nodes.forEach((n) => (posById[n.id] = n.position || { x: 0, y: 0 }));
+    // Group joint supports by joint_group_id and compute a shared junction point.
+    const groups = {};
+    edges.forEach((e) => {
+      if (e.relation === 'supports' && e.joint_group_id) {
+        (groups[e.joint_group_id] = groups[e.joint_group_id] || { target: e.target_id, edges: [] }).edges.push(e);
+      }
+    });
+    const junctionByGroup = {};
+    Object.entries(groups).forEach(([gid, g]) => {
+      const t = posById[g.target];
+      if (!t) return;
+      const sxs = g.edges.map((e) => posById[e.source_id]).filter(Boolean).map((p) => p.x + 112);
+      const jx = sxs.length ? sxs.reduce((a, b) => a + b, 0) / sxs.length : t.x + 112;
+      junctionByGroup[gid] = { junction: { x: jx, y: t.y - 50 }, targetPoint: { x: t.x + 112, y: t.y } };
+    });
+
+    return edges.map((e) => {
+      if (e.relation === 'supports' && e.joint_group_id && junctionByGroup[e.joint_group_id]) {
+        const jg = junctionByGroup[e.joint_group_id];
+        const isTrunk = groups[e.joint_group_id].edges[0].id === e.id;
+        return {
+          id: e.id,
+          source: e.source_id,
+          target: e.target_id,
+          type: 'joint',
+          data: { ...jg, isTrunk },
+          markerEnd: { type: MarkerType.ArrowClosed, color: '#10b981' },
+        };
+      }
+      return {
         id: e.id,
         source: e.source_id,
         target: e.target_id,
-        label: e.joint_group_id ? 'joint' : e.relation.replace('_', ' '),
+        label: e.relation.replace('_', ' '),
         labelStyle: { fontSize: 10, fill: '#94a3b8' },
         labelBgStyle: { fill: '#0f172a' },
         style: edgeStyle(e.relation, e.joint_group_id),
         markerEnd: { type: MarkerType.ArrowClosed, color: edgeStyle(e.relation, e.joint_group_id).stroke },
-      })),
-    [edges]
-  );
+      };
+    });
+  }, [edges, nodes]);
 
   const nodeTypes = useMemo(() => ({ scaffold: ScaffoldNode }), []);
+  const edgeTypes = useMemo(() => ({ joint: JointSupportEdge }), []);
 
   const onConnect = useCallback((params) => {
     setPending(params);
@@ -81,6 +122,7 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
         nodes={rfNodes}
         edges={rfEdges}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         onNodesChange={onNodesChange}
         onNodeDragStop={onNodeDragStop}
         onConnect={onConnect}

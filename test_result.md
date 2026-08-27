@@ -195,7 +195,7 @@ frontend:
 metadata:
   created_by: "main_agent"
   version: "1.0"
-  test_sequence: 1
+  test_sequence: 2
   run_ui: false
 
 test_plan:
@@ -218,3 +218,36 @@ agent_communication:
     -message: "Backend verified working. Frontend built (canvas/notes/graph/timeline + AI sidebar). NOTE: the screenshot automation browser cannot complete in-app fetch() to /api through the preview proxy (request never reaches server), so the canvas shows 'Loading workspace…' ONLY in that headless tool. Verified the API responds to real browser-style CORS GET (200, 0.17s) and OPTIONS preflight (204), and direct browser navigation to /api/health renders JSON — so real browsers work. Awaiting user decision on running automated frontend UI testing."
     -agent: "testing"
     -message: "✅ FRONTEND FULLY TESTED AND WORKING. The suspected fetch hang issue is RESOLVED - it does NOT occur in browser automation. All API calls complete successfully (GET /api/nodes: 200, GET /api/edges: 200). Tested 9 comprehensive steps: (1) Initial load works, no hang. (2) Demo button loads 9 nodes + 7 edges. (3) Node edit via hover/dialog works. (4) Add node creates new nodes. (5) Edge drawing skipped (complex drag). (6) Notes with wikilinks work. (7) Graph view shows connected notes. (8) Rundown shows task chains with status updates. (9) AI sidebar: chat with sources works, critique identifies weakest premise, suggest objection adds new node to canvas. All features functional. No critical issues found."
+
+# ---- Enhancement round 2 ----
+backend_round2:
+  - task: "AI Auto-Structure (POST /api/ai/structure)"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "Takes {text}. Claude returns JSON {claim, premises[], objections[]}. Creates a claim node (1.x), premise nodes (2.x) with supports edges sharing one joint_group_id, and objection nodes (2.x) with objects_to edges. Returns {ok, claim_id, premises, objections}."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ TEST PASSED. POST /api/ai/structure with remote work text returned 200 {ok:true, claim_id:<uuid>, premises:2, objections:1} in 3.92s (real Claude API call). Created claim node with outline_number '1.2' (correct '1.x' format). Created 2 premise nodes with outline_numbers '2.4' and '2.5' (correct '2.x' format) and parent_id == claim_id. All 2 supports edges targeting the claim share the SAME non-null joint_group_id (f6e1f78d-38ee-4f3e-8ea1-4971f5b87303). 1 objection created with objects_to edge having joint_group_id=null (correct). No Mongo _id in responses."
+  - task: "Auto joint-grouping of supports edges (POST /api/edges)"
+    implemented: true
+    working: true
+    file: "app/api/[[...path]]/route.js"
+    needs_retesting: false
+    status_history:
+        -working: "NA"
+        -agent: "main"
+        -comment: "When >1 supports edge points at the same target claim, all of them are assigned a shared joint_group_id (creating one if needed). Single supports edge stays ungrouped (null)."
+        -working: true
+        -agent: "testing"
+        -comment: "✅ TEST PASSED. POST /api/seed reset workspace. Found claim 1.1 'AI will transform knowledge work'. Created 2 new premise nodes (Extra premise A and B). Created 2 supports edges to claim 1.1. Verified all 4 supports edges (2 seeded + 2 new) share ONE identical non-null joint_group_id (e8d029a0-0604-4946-99d6-eac1541afe33). Negative case: Created solo claim with single premise and single supports edge, verified joint_group_id is null (correct behavior for single edge). No Mongo _id in responses."
+
+agent_communication:
+    -agent: "main"
+    -message: "ROUND 2 backend testing. Test two things: (1) POST /api/ai/structure with body {\"text\":\"Remote work boosts productivity because people skip commutes and control their environment, but critics say it harms team collaboration.\"} -> expect 200 {ok:true, claim_id, premises>=2, objections>=0}. Then GET /api/nodes and confirm a new claim + premise nodes exist with outline numbers; GET /api/edges and confirm the new supports edges to that claim SHARE the same joint_group_id (non-null, equal). Real LLM call (~10-20s). (2) Joint-grouping: POST /api/seed, then create two new premises and POST two supports edges to the SAME existing claim; GET /api/edges and confirm both new supports edges (and any prior supports to that claim) share one non-null joint_group_id. Also confirm a lone supports edge to a claim with no other supports has joint_group_id null."
+    -agent: "testing"
+    -message: "✅ ROUND 2 BACKEND TESTS PASSED (2/2). Both new features working correctly: (1) AI Auto-Structure: POST /api/ai/structure creates claim + premises + objections with correct outline_numbers (1.x for claim, 2.x for premises/objections). All supports edges to the claim share ONE non-null joint_group_id. Objects_to edges have joint_group_id=null. Real Claude API call completed in 3.92s. (2) Auto joint-grouping: When multiple supports edges target the same claim, they ALL share one non-null joint_group_id (tested with 4 edges: 2 seeded + 2 new). Single supports edge correctly has joint_group_id=null. No Mongo _id leaks. All UUIDs. Backend round 2 is production-ready."
