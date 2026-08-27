@@ -178,7 +178,14 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
   };
 
   return (
-    <div className="h-full w-full">
+    <div className="h-full w-full relative">
+      {nodes.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center px-6">
+          <p className="text-center text-xl md:text-2xl italic font-light tracking-tight text-muted-foreground/20 select-none">
+            &ldquo;Believe so as to doubt, doubt so as to believe&rdquo;
+          </p>
+        </div>
+      )}
       <ReactFlow
         nodes={rfNodes}
         edges={rfEdges}

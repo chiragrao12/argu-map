@@ -223,7 +223,7 @@ function App() {
           <div className="flex flex-col leading-none">
             <span className="font-bold tracking-tight">Scaffold</span>
             <span className="mt-0.5 text-[10px] italic text-muted-foreground tracking-tight hidden sm:block">
-              Believe so as to doubt, doubt so as to believe
+              Make better sense
             </span>
           </div>
         </div>
