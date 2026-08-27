@@ -197,6 +197,21 @@ function App() {
     }
   };
 
+  const draftRebuttal = async (objectionNode) => {
+    const res = await api.post('ai/rebuttal', { node_id: objectionNode.id });
+    if (res?.node_id) {
+      await refresh();
+      setView('canvas');
+      setTimeout(() => setFocusNodeId(res.node_id), 120);
+      toast.success('Rebuttal added as counter-premise');
+      return res;
+    }
+    toast.error(res?.error || 'Rebuttal failed');
+    return null;
+  };
+
+  const summarizeCluster = useCallback((ids) => api.post('ai/summarize', { node_ids: ids }), []);
+
   return (
     <div className="h-screen w-screen flex flex-col bg-background text-foreground overflow-hidden">
       <Toaster position="top-center" richColors />
@@ -270,7 +285,7 @@ function App() {
             </div>
           )}
           {view === 'notes' && (
-            <NotesView nodes={nodes} onCreate={createNode} onUpdate={updateNode} onDelete={deleteNode} selectedId={selectedId} setSelectedId={setSelectedId} />
+            <NotesView nodes={nodes} onCreate={createNode} onUpdate={updateNode} onDelete={deleteNode} selectedId={selectedId} setSelectedId={setSelectedId} onSummarize={summarizeCluster} />
           )}
           {view === 'graph' && <GraphView nodes={nodes} edges={edges} />}
           {view === 'timeline' && (
@@ -280,7 +295,7 @@ function App() {
 
         {showAI && (
           <aside className="w-[380px] shrink-0 border-l border-border">
-            <AIChat selectedNode={selectedNode} onAddObjection={addObjectionFromAI} />
+            <AIChat selectedNode={selectedNode} onAddObjection={addObjectionFromAI} onDraftRebuttal={draftRebuttal} />
           </aside>
         )}
       </div>

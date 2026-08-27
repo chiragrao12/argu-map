@@ -3,10 +3,10 @@
 import { useRef, useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Send, Sparkles, Bug, Loader2, Brain } from 'lucide-react';
+import { Send, Sparkles, Bug, Loader2, Brain, Shield } from 'lucide-react';
 import Markdown from './Markdown';
 
-export default function AIChat({ selectedNode, onAddObjection }) {
+export default function AIChat({ selectedNode, onAddObjection, onDraftRebuttal }) {
   const [messages, setMessages] = useState([
     { role: 'assistant', content: "Hi! I'm your workspace memory. Ask me things like *\"what have I written about X\"*, or select a claim and hit **Critique** to find its weakest premise." },
   ]);
@@ -79,6 +79,24 @@ export default function AIChat({ selectedNode, onAddObjection }) {
   };
 
   const isArg = selectedNode && ['claim', 'premise', 'objection'].includes(selectedNode.type);
+  const isObjection = selectedNode && selectedNode.type === 'objection';
+
+  const rebut = async () => {
+    if (!isObjection || loading) return;
+    push({ role: 'user', content: `🛡️ Draft a rebuttal to objection: ${selectedNode.title}` });
+    setLoading(true);
+    try {
+      const res = await onDraftRebuttal?.(selectedNode);
+      if (res?.node_id) {
+        push({ role: 'assistant', content: `**${res.title}** ${res.outline_number ? `[${res.outline_number}]` : ''}\n\n${res.content}\n\n_Added to the canvas as a counter-premise contesting the objection._` });
+      } else {
+        push({ role: 'assistant', content: 'Could not draft a rebuttal.' });
+      }
+    } catch (e) {
+      push({ role: 'assistant', content: 'Error: ' + e.message });
+    }
+    setLoading(false);
+  };
 
   return (
     <div className="h-full flex flex-col bg-sidebar">
@@ -94,6 +112,9 @@ export default function AIChat({ selectedNode, onAddObjection }) {
         </Button>
         <Button size="sm" variant="outline" disabled={!isArg || loading} onClick={suggestObjection} className="h-7 text-xs">
           <Sparkles className="h-3 w-3 mr-1" /> Suggest objection
+        </Button>
+        <Button size="sm" variant="outline" disabled={!isObjection || loading} onClick={rebut} className="h-7 text-xs">
+          <Shield className="h-3 w-3 mr-1" /> Draft rebuttal
         </Button>
       </div>
       {selectedNode ? (

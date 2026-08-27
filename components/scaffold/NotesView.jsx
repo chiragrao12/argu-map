@@ -4,7 +4,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-import { Plus, Trash2, Eye, Edit3 } from 'lucide-react';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Plus, Trash2, Eye, Edit3, Sparkles, Loader2 } from 'lucide-react';
 import Markdown from './Markdown';
 
 function renderWithLinks(text, notesByTitle, onOpen) {
@@ -28,11 +30,37 @@ function renderWithLinks(text, notesByTitle, onOpen) {
   });
 }
 
-export default function NotesView({ nodes, onCreate, onUpdate, onDelete, selectedId, setSelectedId }) {
+export default function NotesView({ nodes, onCreate, onUpdate, onDelete, selectedId, setSelectedId, onSummarize }) {
   const notes = useMemo(() => nodes.filter((n) => n.type === 'note'), [nodes]);
   const [draftTitle, setDraftTitle] = useState('');
   const [draftContent, setDraftContent] = useState('');
   const [preview, setPreview] = useState(false);
+  const [checked, setChecked] = useState(() => new Set());
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [summary, setSummary] = useState('');
+  const [summaryBusy, setSummaryBusy] = useState(false);
+
+  const toggleCheck = (id) =>
+    setChecked((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+  const runSummary = async () => {
+    const ids = [...checked];
+    if (!ids.length) return;
+    setSummaryBusy(true);
+    setSummary('');
+    setSummaryOpen(true);
+    try {
+      const res = await onSummarize(ids);
+      setSummary(res?.summary || res?.error || 'No summary produced.');
+    } catch (e) {
+      setSummary('Error: ' + e.message);
+    }
+    setSummaryBusy(false);
+  };
 
   const current = notes.find((n) => n.id === selectedId) || null;
 
@@ -62,21 +90,34 @@ export default function NotesView({ nodes, onCreate, onUpdate, onDelete, selecte
   return (
     <div className="h-full flex">
       <div className="w-64 border-r border-border flex flex-col">
-        <div className="p-3 border-b border-border">
+        <div className="p-3 border-b border-border space-y-2">
           <Button size="sm" className="w-full" onClick={async () => { const n = await onCreate('note', { title: 'New note' }); if (n?.id) setSelectedId(n.id); }}>
             <Plus className="h-4 w-4 mr-1" /> New note
           </Button>
+          {checked.size > 0 && (
+            <Button size="sm" variant="outline" className="w-full" onClick={runSummary}>
+              <Sparkles className="h-4 w-4 mr-1" /> Summarize {checked.size} selected
+            </Button>
+          )}
         </div>
         <div className="flex-1 overflow-auto">
           {notes.map((n) => (
-            <button
+            <div
               key={n.id}
+              className={`flex items-start gap-2 px-3 py-2 border-b border-border/50 hover:bg-muted cursor-pointer ${selectedId === n.id ? 'bg-muted' : ''}`}
               onClick={() => setSelectedId(n.id)}
-              className={`w-full text-left px-3 py-2 border-b border-border/50 hover:bg-muted ${selectedId === n.id ? 'bg-muted' : ''}`}
             >
-              <div className="text-sm font-medium truncate">{n.title}</div>
-              <div className="text-xs text-muted-foreground truncate">{(n.content || '').replace(/[#*\[\]]/g, '').slice(0, 40) || 'Empty'}</div>
-            </button>
+              <Checkbox
+                className="mt-0.5"
+                checked={checked.has(n.id)}
+                onCheckedChange={() => toggleCheck(n.id)}
+                onClick={(e) => e.stopPropagation()}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium truncate">{n.title}</div>
+                <div className="text-xs text-muted-foreground truncate">{(n.content || '').replace(/[#*\[\]]/g, '').slice(0, 40) || 'Empty'}</div>
+              </div>
+            </div>
           ))}
           {!notes.length && <p className="p-3 text-xs text-muted-foreground">No notes yet.</p>}
         </div>
@@ -126,6 +167,21 @@ export default function NotesView({ nodes, onCreate, onUpdate, onDelete, selecte
           <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">Select or create a note</div>
         )}
       </div>
+
+      <Dialog open={summaryOpen} onOpenChange={setSummaryOpen}>
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-auto">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><Sparkles className="h-4 w-4 text-emerald-400" /> Cluster summary</DialogTitle>
+          </DialogHeader>
+          {summaryBusy ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground py-6">
+              <Loader2 className="h-4 w-4 animate-spin" /> Summarizing {checked.size} notes…
+            </div>
+          ) : (
+            <Markdown>{summary}</Markdown>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

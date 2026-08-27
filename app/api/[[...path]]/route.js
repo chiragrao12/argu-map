@@ -290,6 +290,56 @@ export async function POST(request) {
       return json({ objection: parsed });
     }
 
+    if (parts[0] === 'ai' && parts[1] === 'rebuttal') {
+      const obj = await db.collection('nodes').findOne({ id: body.node_id });
+      if (!obj) return json({ error: 'Node not found' }, 404);
+      let claimText = '';
+      if (obj.parent_id) {
+        const claim = await db.collection('nodes').findOne({ id: obj.parent_id });
+        if (claim) claimText = `[${claim.outline_number || ''}] ${claim.title}: ${claim.content || ''}`;
+      }
+      const system =
+        'You defend the original claim against a stated objection by drafting a concise rebuttal (a counter-premise). Respond in STRICT JSON only: {"title":"<=10 words","content":"2-3 sentence rebuttal that undercuts the objection"}. No markdown, no extra text.';
+      const user = `ORIGINAL CLAIM: ${claimText || '(unknown)'}\nOBJECTION TO REBUT: [${obj.outline_number || ''}] ${obj.title}: ${obj.content || ''}`;
+      const raw = await chat(system, user, 500);
+      let parsed = { title: 'Rebuttal', content: raw };
+      try {
+        const m = raw.match(/\{[\s\S]*\}/);
+        if (m) parsed = JSON.parse(m[0]);
+      } catch (_) {}
+      const now = new Date().toISOString();
+      const node = {
+        id: uuidv4(),
+        workspace_id: WS,
+        title: parsed.title || 'Rebuttal',
+        content: parsed.content || '',
+        type: 'premise',
+        status: null,
+        due_date: null,
+        outline_number: await computeOutline(db, obj.id),
+        parent_id: obj.id,
+        position: { x: (obj.position?.x || 300) - 30, y: (obj.position?.y || 300) + 210 },
+        color: null,
+        created_at: now,
+        updated_at: now,
+      };
+      await db.collection('nodes').insertOne({ ...node });
+      const edge = { id: uuidv4(), workspace_id: WS, source_id: node.id, target_id: obj.id, relation: 'objects_to', joint_group_id: null, style: 'dashed' };
+      await db.collection('edges').insertOne({ ...edge });
+      return json({ node_id: node.id, title: node.title, content: node.content, outline_number: node.outline_number });
+    }
+
+    if (parts[0] === 'ai' && parts[1] === 'summarize') {
+      const ids = Array.isArray(body.node_ids) ? body.node_ids : [];
+      if (!ids.length) return json({ error: 'No nodes selected' }, 400);
+      const nodes = await db.collection('nodes').find({ workspace_id: WS, id: { $in: ids } }).toArray();
+      const text = nodes.map((n) => `### ${n.title}\n${n.content || ''}`).join('\n\n');
+      const system =
+        "You synthesize a cluster of the user's notes into a concise summary. Produce short markdown with: a 1-2 sentence overview, key themes as bullets, notable connections between the notes, and any open questions. Ground everything strictly in the provided notes.";
+      const summary = await chat(system, `NOTES CLUSTER:\n${text}`, 900);
+      return json({ summary, count: nodes.length });
+    }
+
     if (parts[0] === 'seed') {
       await db.collection('nodes').deleteMany({ workspace_id: WS });
       await db.collection('edges').deleteMany({ workspace_id: WS });

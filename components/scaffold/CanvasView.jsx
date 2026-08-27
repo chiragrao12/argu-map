@@ -2,15 +2,19 @@
 
 import '@xyflow/react/dist/style.css';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { toPng } from 'html-to-image';
 import {
   ReactFlow,
   ReactFlowProvider,
   Background,
   Controls,
   MiniMap,
+  Panel,
   applyNodeChanges,
   MarkerType,
   useReactFlow,
+  getNodesBounds,
+  getViewportForBounds,
 } from '@xyflow/react';
 import ScaffoldNode from './ScaffoldNode';
 import JointSupportEdge from './JointSupportEdge';
@@ -18,6 +22,36 @@ import { RELATIONS } from './constants';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Image, FileDown } from 'lucide-react';
+
+function download(dataUrl, name) {
+  const a = document.createElement('a');
+  a.setAttribute('download', name);
+  a.setAttribute('href', dataUrl);
+  a.click();
+}
+
+function buildMarkdown(nodes, edges) {
+  const argTypes = ['claim', 'premise', 'objection'];
+  const args = nodes.filter((n) => argTypes.includes(n.type));
+  const childrenOf = {};
+  args.forEach((n) => {
+    if (n.parent_id) (childrenOf[n.parent_id] = childrenOf[n.parent_id] || []).push(n);
+  });
+  const roots = args.filter((n) => !n.parent_id || !args.find((p) => p.id === n.parent_id));
+  const seen = new Set();
+  const lines = ['# Argument Map', ''];
+  const walk = (n, depth) => {
+    if (seen.has(n.id)) return;
+    seen.add(n.id);
+    const tag = n.type === 'objection' ? 'Objection' : n.type === 'claim' ? 'Claim' : 'Premise';
+    lines.push(`${'  '.repeat(depth)}- **[${n.outline_number || '?'}] ${tag}:** ${n.title}${n.content ? ` — ${n.content}` : ''}`);
+    (childrenOf[n.id] || []).sort((a, b) => (a.outline_number || '').localeCompare(b.outline_number || '')).forEach((c) => walk(c, depth + 1));
+  };
+  roots.sort((a, b) => (a.outline_number || '').localeCompare(b.outline_number || '')).forEach((r) => walk(r, 0));
+  if (lines.length === 2) lines.push('_No argument nodes yet._');
+  return lines.join('\n');
+}
 
 function edgeStyle(relation, joint) {
   if (relation === 'supports')
@@ -32,7 +66,34 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
   const [rfNodes, setRfNodes] = useState([]);
   const [pending, setPending] = useState(null);
   const [relation, setRelation] = useState('supports');
-  const { setCenter } = useReactFlow();
+  const { setCenter, getNodes } = useReactFlow();
+
+  const exportPng = useCallback(() => {
+    const flowNodes = getNodes();
+    if (!flowNodes.length) return;
+    const bounds = getNodesBounds(flowNodes);
+    const width = 1600;
+    const height = 1000;
+    const vp = getViewportForBounds(bounds, width, height, 0.3, 2, 0.15);
+    const viewport = document.querySelector('.react-flow__viewport');
+    if (!viewport) return;
+    toPng(viewport, {
+      backgroundColor: '#0b1220',
+      width,
+      height,
+      style: {
+        width: `${width}px`,
+        height: `${height}px`,
+        transform: `translate(${vp.x}px, ${vp.y}px) scale(${vp.zoom})`,
+      },
+    }).then((url) => download(url, 'scaffold-argument-map.png'));
+  }, [getNodes]);
+
+  const exportMd = useCallback(() => {
+    const md = buildMarkdown(nodes, edges);
+    const url = `data:text/markdown;charset=utf-8,${encodeURIComponent(md)}`;
+    download(url, 'scaffold-argument-map.md');
+  }, [nodes, edges]);
 
   const toRf = useCallback(
     (n) => ({
@@ -131,6 +192,14 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
         proOptions={{ hideAttribution: true }}
       >
         <Background color="#334155" gap={20} />
+        <Panel position="top-left" className="flex gap-2">
+          <Button size="sm" variant="secondary" className="h-7 text-xs shadow" onClick={exportPng}>
+            <Image className="h-3.5 w-3.5 mr-1" /> PNG
+          </Button>
+          <Button size="sm" variant="secondary" className="h-7 text-xs shadow" onClick={exportMd}>
+            <FileDown className="h-3.5 w-3.5 mr-1" /> Markdown
+          </Button>
+        </Panel>
         <Controls className="!bg-slate-800 !border-slate-700 [&_button]:!bg-slate-800 [&_button]:!border-slate-700 [&_button]:!fill-slate-300" />
         <MiniMap pannable zoomable className="!bg-slate-900" nodeColor={(n) => (n.data?.type === 'objection' ? '#f59e0b' : n.data?.type === 'task' ? '#3b82f6' : '#e2e8f0')} />
       </ReactFlow>
