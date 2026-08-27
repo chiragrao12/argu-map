@@ -220,7 +220,12 @@ function App() {
           <div className="h-7 w-7 rounded bg-emerald-500 flex items-center justify-center">
             <Brain className="h-4 w-4 text-slate-950" />
           </div>
-          <span className="font-bold tracking-tight">Scaffold</span>
+          <div className="flex flex-col leading-none">
+            <span className="font-bold tracking-tight">Scaffold</span>
+            <span className="mt-0.5 text-[10px] italic text-muted-foreground tracking-tight hidden sm:block">
+              Believe so as to doubt, doubt so as to believe
+            </span>
+          </div>
         </div>
 
         <nav className="flex items-center gap-1 ml-4">
