@@ -19,3 +19,11 @@ export const RELATIONS = [
   { value: 'backlink', label: 'Backlink (plain link)' },
   { value: 'follow_up', label: 'Follow-up (task → next task)' },
 ];
+
+export const STRENGTHS = [
+  { value: 'weak', label: 'Weak' },
+  { value: 'moderate', label: 'Moderate' },
+  { value: 'strong', label: 'Strong' },
+];
+
+export const STRENGTH_WIDTH = { weak: 1.5, moderate: 2.5, strong: 4 };

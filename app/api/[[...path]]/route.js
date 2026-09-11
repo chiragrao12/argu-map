@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { getDb } from '@/lib/db';
 import { chat, retrieve } from '@/lib/ai';
+import { detectCycle } from '@/lib/graph';
+import { tidyLayout } from '@/lib/layout';
 
 const WS = 'default';
 const ARG_TYPES = ['claim', 'premise', 'objection'];
@@ -21,19 +23,47 @@ function segments(request) {
   return pathname.replace(/^\/api\/?/, '').split('/').filter(Boolean);
 }
 
-async function computeOutline(db, parent_id) {
-  let depth = 1;
-  if (parent_id) {
-    const parent = await db.collection('nodes').findOne({ id: parent_id });
-    const pnum = parent?.outline_number;
-    const pdepth = pnum ? parseInt(pnum.split('.')[0], 10) : 1;
-    depth = (isNaN(pdepth) ? 1 : pdepth) + 1;
+// Sibling-count outline numbering, scoped by parent (and by case for
+// root-level argument nodes). Produces real hierarchical numbers like
+// "1", "1.1", "1.1.1" instead of a workspace-wide depth counter.
+// `excludeId` must be passed when renumbering a node that may already carry
+// the parent/case it's being counted against (e.g. re-running this for an
+// already-parented node) — otherwise the count query matches the node
+// itself and inflates its own number by one.
+async function computeOutline(db, parentId, caseId, excludeId = null) {
+  if (parentId) {
+    const parent = await db.collection('nodes').findOne({ id: parentId });
+    const query = { workspace_id: WS, parent_id: parentId };
+    if (excludeId) query.id = { $ne: excludeId };
+    const count = await db.collection('nodes').countDocuments(query);
+    return `${parent?.outline_number || '1'}.${count + 1}`;
   }
-  const count = await db.collection('nodes').countDocuments({
-    workspace_id: WS,
-    outline_number: { $regex: `^${depth}\\.` },
-  });
-  return `${depth}.${count + 1}`;
+  const query = { workspace_id: WS, case_id: caseId, parent_id: null, type: { $in: ARG_TYPES } };
+  if (excludeId) query.id = { $ne: excludeId };
+  const count = await db.collection('nodes').countDocuments(query);
+  return `${count + 1}`;
+}
+
+// Promote a node to a root within its case: clears parent_id and assigns a
+// fresh root-level outline number. Used both when a parent is deleted
+// (its children are promoted rather than left dangling) and by the manual
+// "detach" integrity-repair action.
+async function detachNode(db, node) {
+  const outline_number = ARG_TYPES.includes(node.type) ? await computeOutline(db, null, node.case_id, node.id) : null;
+  await db.collection('nodes').updateOne(
+    { id: node.id },
+    { $set: { parent_id: null, outline_number, updated_at: new Date().toISOString() } }
+  );
+}
+
+// A joint group of one edge isn't a joint group any more — dissolve it back
+// to a plain solo support edge.
+async function pruneGroupIfSingleton(db, groupId) {
+  if (!groupId) return;
+  const members = await db.collection('edges').find({ workspace_id: WS, joint_group_id: groupId }).toArray();
+  if (members.length <= 1) {
+    await db.collection('edges').updateMany({ workspace_id: WS, joint_group_id: groupId }, { $set: { joint_group_id: null } });
+  }
 }
 
 async function buildArgumentText(db, rootId) {
@@ -76,6 +106,10 @@ export async function GET(request) {
     const parts = segments(request);
     const db = await getDb();
     if (parts[0] === 'health' || parts.length === 0) return json({ ok: true, service: 'scaffold' });
+    if (parts[0] === 'cases') {
+      const cases = await db.collection('cases').find({ workspace_id: WS }).toArray();
+      return json(cases.map(clean));
+    }
     if (parts[0] === 'nodes') {
       const nodes = await db.collection('nodes').find({ workspace_id: WS }).toArray();
       return json(nodes.map(clean));
@@ -97,11 +131,59 @@ export async function POST(request) {
     const db = await getDb();
     const body = await request.json().catch(() => ({}));
 
-    if (parts[0] === 'nodes') {
+    if (parts[0] === 'cases' && parts.length === 1) {
+      const now = new Date().toISOString();
+      const caseDoc = {
+        id: uuidv4(),
+        workspace_id: WS,
+        title: body.title || 'Untitled case',
+        description: body.description || '',
+        created_at: now,
+        updated_at: now,
+      };
+      await db.collection('cases').insertOne({ ...caseDoc });
+      return json(caseDoc);
+    }
+
+    if (parts[0] === 'cases' && parts[1] && parts[2] === 'tidy') {
+      const caseDoc = await db.collection('cases').findOne({ id: parts[1] });
+      if (!caseDoc) return json({ error: 'Case not found' }, 404);
+      const nodes = await db.collection('nodes').find({ workspace_id: WS, case_id: parts[1] }).toArray();
+      const positions = tidyLayout(nodes, parts[1]);
+      const now = new Date().toISOString();
+      const ops = Object.entries(positions).map(([id, position]) => ({
+        updateOne: { filter: { id }, update: { $set: { position, updated_at: now } } },
+      }));
+      if (ops.length) await db.collection('nodes').bulkWrite(ops);
+      return json({ ok: true, updated: ops.length });
+    }
+
+    if (parts[0] === 'nodes' && parts[1] && parts[2] === 'detach') {
+      const node = await db.collection('nodes').findOne({ id: parts[1] });
+      if (!node) return json({ error: 'Node not found' }, 404);
+      await detachNode(db, node);
+      const updated = await db.collection('nodes').findOne({ id: parts[1] });
+      return json(clean(updated));
+    }
+
+    if (parts[0] === 'nodes' && parts.length === 1) {
       const now = new Date().toISOString();
       const type = body.type || 'note';
+      let case_id = null;
       let outline_number = null;
-      if (ARG_TYPES.includes(type)) outline_number = await computeOutline(db, body.parent_id);
+      if (ARG_TYPES.includes(type)) {
+        if (body.parent_id) {
+          const parent = await db.collection('nodes').findOne({ id: body.parent_id });
+          if (!parent) return json({ error: 'Parent node not found' }, 404);
+          case_id = parent.case_id;
+        } else {
+          case_id = body.case_id || null;
+          if (!case_id) return json({ error: 'case_id is required for a root claim/premise/objection' }, 400);
+          const caseDoc = await db.collection('cases').findOne({ id: case_id });
+          if (!caseDoc) return json({ error: 'Case not found' }, 404);
+        }
+        outline_number = await computeOutline(db, body.parent_id || null, case_id);
+      }
       const node = {
         id: uuidv4(),
         workspace_id: WS,
@@ -112,6 +194,7 @@ export async function POST(request) {
         due_date: body.due_date || null,
         outline_number,
         parent_id: body.parent_id || null,
+        case_id,
         position: body.position || { x: 120 + Math.random() * 320, y: 120 + Math.random() * 200 },
         color: body.color || (type === 'objection' ? 'amber' : null),
         created_at: now,
@@ -121,16 +204,60 @@ export async function POST(request) {
       return json(node);
     }
 
-    if (parts[0] === 'edges') {
+    if (parts[0] === 'edges' && parts[1] === 'group' && parts.length === 2) {
+      const edgeIds = Array.isArray(body.edge_ids) ? body.edge_ids : [];
+      if (edgeIds.length < 2) return json({ error: 'Select at least 2 edges to group' }, 400);
+      const edgesToGroup = await db.collection('edges').find({ workspace_id: WS, id: { $in: edgeIds } }).toArray();
+      if (edgesToGroup.length !== edgeIds.length) return json({ error: 'Some edges were not found' }, 404);
+      if (!edgesToGroup.every((e) => e.relation === 'supports')) return json({ error: 'Only supports edges can be grouped' }, 400);
+      const targets = new Set(edgesToGroup.map((e) => e.target_id));
+      if (targets.size !== 1) return json({ error: 'Edges must all point at the same claim' }, 400);
+      const oldGroupIds = [...new Set(edgesToGroup.map((e) => e.joint_group_id).filter(Boolean))];
+      const gid = uuidv4();
+      await db.collection('edges').updateMany({ workspace_id: WS, id: { $in: edgeIds } }, { $set: { joint_group_id: gid } });
+      for (const oldGid of oldGroupIds) await pruneGroupIfSingleton(db, oldGid);
+      return json({ ok: true, joint_group_id: gid });
+    }
+
+    if (parts[0] === 'edges' && parts[1] && parts[2] === 'ungroup') {
+      const edge = await db.collection('edges').findOne({ id: parts[1] });
+      if (!edge) return json({ error: 'Edge not found' }, 404);
+      const oldGid = edge.joint_group_id;
+      if (oldGid) {
+        await db.collection('edges').updateOne({ id: parts[1] }, { $set: { joint_group_id: null } });
+        await pruneGroupIfSingleton(db, oldGid);
+      }
+      return json({ ok: true });
+    }
+
+    if (parts[0] === 'edges' && parts.length === 1) {
       const relation = body.relation || 'backlink';
       const style = relation === 'objects_to' ? 'dashed' : 'solid';
+
+      if (relation === 'supports' || relation === 'objects_to') {
+        const [src, tgt] = await Promise.all([
+          db.collection('nodes').findOne({ id: body.source_id }),
+          db.collection('nodes').findOne({ id: body.target_id }),
+        ]);
+        if (!src || !tgt) return json({ error: 'Source or target node not found' }, 404);
+        if (src.case_id !== tgt.case_id) return json({ error: "Cross-case connections aren't allowed" }, 400);
+        const existingEdges = await db.collection('edges').find({ workspace_id: WS }).toArray();
+        if (detectCycle(existingEdges, body.source_id, body.target_id)) {
+          return json({ error: 'Would create a circular argument' }, 400);
+        }
+      }
+
+      const STRENGTHS = ['weak', 'moderate', 'strong'];
+      const strength = relation === 'supports' ? (STRENGTHS.includes(body.strength) ? body.strength : 'moderate') : null;
+
       const edge = {
         id: uuidv4(),
         workspace_id: WS,
         source_id: body.source_id,
         target_id: body.target_id,
         relation,
-        joint_group_id: body.joint_group_id || null,
+        strength,
+        joint_group_id: null,
         style,
       };
       await db.collection('edges').insertOne({ ...edge });
@@ -138,25 +265,11 @@ export async function POST(request) {
       if (relation === 'supports' || relation === 'objects_to') {
         const src = await db.collection('nodes').findOne({ id: body.source_id });
         if (src && ARG_TYPES.includes(src.type)) {
-          const outline_number = await computeOutline(db, body.target_id);
+          const outline_number = await computeOutline(db, body.target_id, src.case_id, src.id);
           await db.collection('nodes').updateOne(
             { id: body.source_id },
             { $set: { parent_id: body.target_id, outline_number, updated_at: new Date().toISOString() } }
           );
-        }
-      }
-      // Auto joint-grouping: all "supports" edges pointing at the same claim form one joint trunk.
-      if (relation === 'supports' && !edge.joint_group_id) {
-        const siblings = await db
-          .collection('edges')
-          .find({ workspace_id: WS, relation: 'supports', target_id: body.target_id })
-          .toArray();
-        if (siblings.length > 1) {
-          const gid = siblings.find((s) => s.joint_group_id)?.joint_group_id || uuidv4();
-          await db
-            .collection('edges')
-            .updateMany({ workspace_id: WS, relation: 'supports', target_id: body.target_id }, { $set: { joint_group_id: gid } });
-          edge.joint_group_id = gid;
         }
       }
       return json(edge);
@@ -164,7 +277,11 @@ export async function POST(request) {
 
     if (parts[0] === 'ai' && parts[1] === 'structure') {
       const text = (body.text || '').trim();
+      const case_id = body.case_id;
       if (!text) return json({ error: 'No text provided' }, 400);
+      if (!case_id) return json({ error: 'case_id is required' }, 400);
+      const caseDoc = await db.collection('cases').findOne({ id: case_id });
+      if (!caseDoc) return json({ error: 'Case not found' }, 404);
       const system =
         'You are an argument-mapping assistant. Given a rough paragraph, extract its core CLAIM, the PREMISES that support it, and any OBJECTIONS present. Respond in STRICT JSON only (no markdown, no prose): {"claim":{"title":"<=10 words","content":"one sentence"},"premises":[{"title":"<=10 words","content":"one sentence"}],"objections":[{"title":"<=10 words","content":"one sentence"}]}. Provide 2 to 4 premises. Objections may be an empty array.';
       const raw = await chat(system, text, 1000);
@@ -185,6 +302,7 @@ export async function POST(request) {
         due_date: null,
         outline_number: null,
         parent_id: null,
+        case_id: null,
         position: { x: 0, y: 0 },
         color: null,
         created_at: now(),
@@ -194,29 +312,30 @@ export async function POST(request) {
       const claim = baseNode({
         id: uuidv4(),
         type: 'claim',
+        case_id,
         title: data.claim?.title || 'Claim',
         content: data.claim?.content || '',
-        outline_number: await computeOutline(db, null),
+        outline_number: await computeOutline(db, null, case_id),
         position: { x: 540, y: 80 },
       });
       await db.collection('nodes').insertOne({ ...claim });
       const premises = Array.isArray(data.premises) ? data.premises.slice(0, 4) : [];
       const objections = Array.isArray(data.objections) ? data.objections.slice(0, 3) : [];
-      const jg = premises.length > 1 ? uuidv4() : null;
       const createdEdges = [];
       let px = 180;
       for (const p of premises) {
         const node = baseNode({
           id: uuidv4(),
           type: 'premise',
+          case_id,
           title: p.title || 'Premise',
           content: p.content || '',
           parent_id: claim.id,
-          outline_number: await computeOutline(db, claim.id),
+          outline_number: await computeOutline(db, claim.id, case_id),
           position: { x: px, y: 360 },
         });
         await db.collection('nodes').insertOne({ ...node });
-        const e = { id: uuidv4(), workspace_id: WS, source_id: node.id, target_id: claim.id, relation: 'supports', joint_group_id: jg, style: 'solid' };
+        const e = { id: uuidv4(), workspace_id: WS, source_id: node.id, target_id: claim.id, relation: 'supports', joint_group_id: null, style: 'solid' };
         await db.collection('edges').insertOne({ ...e });
         createdEdges.push(e);
         px += 280;
@@ -226,11 +345,12 @@ export async function POST(request) {
         const node = baseNode({
           id: uuidv4(),
           type: 'objection',
+          case_id,
           color: 'amber',
           title: o.title || 'Objection',
           content: o.content || '',
           parent_id: claim.id,
-          outline_number: await computeOutline(db, claim.id),
+          outline_number: await computeOutline(db, claim.id, case_id),
           position: { x: ox, y: 360 },
         });
         await db.collection('nodes').insertOne({ ...node });
@@ -316,8 +436,9 @@ export async function POST(request) {
         type: 'premise',
         status: null,
         due_date: null,
-        outline_number: await computeOutline(db, obj.id),
+        outline_number: await computeOutline(db, obj.id, obj.case_id),
         parent_id: obj.id,
+        case_id: obj.case_id,
         position: { x: (obj.position?.x || 300) - 30, y: (obj.position?.y || 300) + 210 },
         color: null,
         created_at: now,
@@ -327,6 +448,170 @@ export async function POST(request) {
       const edge = { id: uuidv4(), workspace_id: WS, source_id: node.id, target_id: obj.id, relation: 'objects_to', joint_group_id: null, style: 'dashed' };
       await db.collection('edges').insertOne({ ...edge });
       return json({ node_id: node.id, title: node.title, content: node.content, outline_number: node.outline_number });
+    }
+
+    if (parts[0] === 'ai' && parts[1] === 'steelman') {
+      const node = await db.collection('nodes').findOne({ id: body.node_id });
+      if (!node) return json({ error: 'Node not found' }, 404);
+      const argText = await buildArgumentText(db, node.id);
+      const system =
+        'You steelman arguments: given a claim and its premises/objections, restate the argument in its strongest, most charitable and persuasive form, tightening weak phrasing and making the best possible case for the claim without inventing new premises. Respond in concise markdown (a short paragraph or a few bullets). Do not critique it.';
+      const user = `ARGUMENT:\n${argText}`;
+      const steelman = await chat(system, user, 900);
+      return json({ steelman });
+    }
+
+    if (parts[0] === 'ai' && parts[1] === 'crux') {
+      const node = await db.collection('nodes').findOne({ id: body.node_id });
+      if (!node) return json({ error: 'Node not found' }, 404);
+      if (node.type !== 'claim') return json({ error: 'Crux-finder starts from a claim' }, 400);
+      const argText = await buildArgumentText(db, node.id);
+      const system =
+        'You identify the crux of an argument: the single most important piece of evidence or event that, if it occurred or were revealed, would most change whether the claim is true. Respond in STRICT JSON only: {"question":"one sentence, phrased as \'What would change my mind: ...\'","task_title":"<=10 words"}. No markdown, no extra text.';
+      const user = `ARGUMENT:\n${argText}`;
+      const raw = await chat(system, user, 400);
+      let parsed = { question: raw, task_title: 'Find crux evidence' };
+      try {
+        const m = raw.match(/\{[\s\S]*\}/);
+        if (m) parsed = JSON.parse(m[0]);
+      } catch (_) {}
+      const now = new Date().toISOString();
+      const taskNode = {
+        id: uuidv4(),
+        workspace_id: WS,
+        title: parsed.task_title || 'Find crux evidence',
+        content: `Crux for [${node.outline_number || ''}] ${node.title}: ${parsed.question || ''}`,
+        type: 'task',
+        status: 'todo',
+        due_date: null,
+        outline_number: null,
+        parent_id: null,
+        case_id: null,
+        position: { x: 120 + Math.random() * 320, y: 760 },
+        color: null,
+        created_at: now,
+        updated_at: now,
+      };
+      await db.collection('nodes').insertOne({ ...taskNode });
+      return json({ task_id: taskNode.id, title: taskNode.title, content: taskNode.content, question: parsed.question });
+    }
+
+    if (parts[0] === 'ai' && parts[1] === 'weak-links') {
+      const case_id = body.case_id;
+      if (!case_id) return json({ error: 'case_id is required' }, 400);
+      const claims = await db.collection('nodes').find({ workspace_id: WS, case_id, type: 'claim' }).toArray();
+      const results = [];
+      for (const claim of claims) {
+        const premiseCount = await db.collection('nodes').countDocuments({ workspace_id: WS, parent_id: claim.id, type: 'premise' });
+        if (!premiseCount) continue;
+        const argText = await buildArgumentText(db, claim.id);
+        const system =
+          'Given a claim and its supporting premises, identify the single weakest premise. Respond in STRICT JSON only: {"outline":"its outline number","title":"its title","reason":"one sentence why it is the weakest"}. No markdown, no extra text.';
+        const raw = await chat(system, `ARGUMENT:\n${argText}`, 300);
+        let weakest = null;
+        try {
+          const m = raw.match(/\{[\s\S]*\}/);
+          if (m) weakest = JSON.parse(m[0]);
+        } catch (_) {}
+        results.push({ claim_id: claim.id, claim_title: claim.title, claim_outline: claim.outline_number, weakest });
+      }
+      return json({ results });
+    }
+
+    if (parts[0] === 'ai' && parts[1] === 'debate') {
+      const claim = await db.collection('nodes').findOne({ id: body.node_id });
+      if (!claim) return json({ error: 'Node not found' }, 404);
+      if (claim.type !== 'claim') return json({ error: "Devil's advocate mode starts from a claim" }, 400);
+      const rounds = Math.min(3, Math.max(1, parseInt(body.rounds, 10) || 2));
+
+      const createdIds = [];
+      let currentParent = claim;
+      let roundsCompleted = 0;
+
+      for (let i = 0; i < rounds; i++) {
+        const argText = await buildArgumentText(db, claim.id);
+        const objSystem =
+          "You are a sharp debate opponent running a multi-round devil's-advocate exercise. Given the argument so far (including any prior objections and rebuttals), propose ONE strong, specific NEW objection that directly attacks the most recent rebuttal (or the claim itself if there is no rebuttal yet) without repeating earlier objections. Respond in strict JSON only: {\"title\": \"short objection title (<=8 words)\", \"content\": \"2-3 sentence explanation of the objection\"}. No markdown, no extra text.";
+        const objRaw = await chat(objSystem, `ARGUMENT SO FAR:\n${argText}`, 500);
+        let objParsed = { title: 'Objection', content: objRaw };
+        try {
+          const m = objRaw.match(/\{[\s\S]*\}/);
+          if (m) objParsed = JSON.parse(m[0]);
+        } catch (_) {}
+
+        const now1 = new Date().toISOString();
+        const objNode = {
+          id: uuidv4(),
+          workspace_id: WS,
+          title: objParsed.title || 'Objection',
+          content: objParsed.content || '',
+          type: 'objection',
+          status: null,
+          due_date: null,
+          outline_number: await computeOutline(db, currentParent.id, claim.case_id),
+          parent_id: currentParent.id,
+          case_id: claim.case_id,
+          position: { x: (currentParent.position?.x || 300) + 260, y: (currentParent.position?.y || 100) + 210 },
+          color: 'amber',
+          created_at: now1,
+          updated_at: now1,
+        };
+        await db.collection('nodes').insertOne({ ...objNode });
+        await db.collection('edges').insertOne({
+          id: uuidv4(),
+          workspace_id: WS,
+          source_id: objNode.id,
+          target_id: currentParent.id,
+          relation: 'objects_to',
+          joint_group_id: null,
+          style: 'dashed',
+        });
+        createdIds.push(objNode.id);
+
+        const rebSystem =
+          'You defend the original claim against a stated objection by drafting a concise rebuttal (a counter-premise). Respond in STRICT JSON only: {"title":"<=10 words","content":"2-3 sentence rebuttal that undercuts the objection"}. No markdown, no extra text.';
+        const rebUser = `ORIGINAL CLAIM: [${claim.outline_number || ''}] ${claim.title}: ${claim.content || ''}\nOBJECTION TO REBUT: [${objNode.outline_number || ''}] ${objNode.title}: ${objNode.content || ''}`;
+        const rebRaw = await chat(rebSystem, rebUser, 500);
+        let rebParsed = { title: 'Rebuttal', content: rebRaw };
+        try {
+          const m = rebRaw.match(/\{[\s\S]*\}/);
+          if (m) rebParsed = JSON.parse(m[0]);
+        } catch (_) {}
+
+        const now2 = new Date().toISOString();
+        const rebNode = {
+          id: uuidv4(),
+          workspace_id: WS,
+          title: rebParsed.title || 'Rebuttal',
+          content: rebParsed.content || '',
+          type: 'premise',
+          status: null,
+          due_date: null,
+          outline_number: await computeOutline(db, objNode.id, claim.case_id),
+          parent_id: objNode.id,
+          case_id: claim.case_id,
+          position: { x: (objNode.position?.x || 300) - 30, y: (objNode.position?.y || 300) + 210 },
+          color: null,
+          created_at: now2,
+          updated_at: now2,
+        };
+        await db.collection('nodes').insertOne({ ...rebNode });
+        await db.collection('edges').insertOne({
+          id: uuidv4(),
+          workspace_id: WS,
+          source_id: rebNode.id,
+          target_id: objNode.id,
+          relation: 'objects_to',
+          joint_group_id: null,
+          style: 'dashed',
+        });
+        createdIds.push(rebNode.id);
+
+        currentParent = rebNode;
+        roundsCompleted += 1;
+      }
+
+      return json({ rounds_completed: roundsCompleted, node_ids: createdIds });
     }
 
     if (parts[0] === 'ai' && parts[1] === 'summarize') {
@@ -340,10 +625,44 @@ export async function POST(request) {
       return json({ summary, count: nodes.length });
     }
 
+    if (parts[0] === 'migrate-cases') {
+      const allNodes = await db.collection('nodes').find({ workspace_id: WS }).toArray();
+      const targets = allNodes.filter((n) => ARG_TYPES.includes(n.type) && !n.case_id);
+      if (!targets.length) return json({ ok: true, created: 0, message: 'Nothing to migrate.' });
+
+      const byId = {};
+      allNodes.forEach((n) => (byId[n.id] = n));
+      const visited = new Set();
+      let created = 0;
+      for (const start of targets) {
+        if (visited.has(start.id)) continue;
+        let root = start;
+        while (root.parent_id && byId[root.parent_id]) root = byId[root.parent_id];
+        const componentIds = [];
+        const stack = [root.id];
+        while (stack.length) {
+          const cur = stack.pop();
+          if (visited.has(cur)) continue;
+          visited.add(cur);
+          componentIds.push(cur);
+          allNodes.filter((x) => x.parent_id === cur).forEach((x) => stack.push(x.id));
+        }
+        const now = new Date().toISOString();
+        const caseDoc = { id: uuidv4(), workspace_id: WS, title: root.title || 'Untitled case', description: '', created_at: now, updated_at: now };
+        await db.collection('cases').insertOne({ ...caseDoc });
+        await db.collection('nodes').updateMany({ workspace_id: WS, id: { $in: componentIds } }, { $set: { case_id: caseDoc.id } });
+        created += 1;
+      }
+      return json({ ok: true, created });
+    }
+
     if (parts[0] === 'seed') {
       await db.collection('nodes').deleteMany({ workspace_id: WS });
       await db.collection('edges').deleteMany({ workspace_id: WS });
+      await db.collection('cases').deleteMany({ workspace_id: WS });
       const now = new Date().toISOString();
+      const caseDoc = { id: uuidv4(), workspace_id: WS, title: 'AI will transform knowledge work', description: '', created_at: now, updated_at: now };
+      await db.collection('cases').insertOne({ ...caseDoc });
       const mk = (o) => ({
         workspace_id: WS,
         title: 'Untitled',
@@ -353,20 +672,21 @@ export async function POST(request) {
         due_date: null,
         outline_number: null,
         parent_id: null,
+        case_id: null,
         color: null,
         created_at: now,
         updated_at: now,
         ...o,
       });
-      const claim = mk({ id: uuidv4(), type: 'claim', outline_number: '1.1', title: 'AI will transform knowledge work', content: 'Large-scale automation of cognitive tasks is imminent and will reshape how professionals work.', position: { x: 520, y: 60 } });
-      const p1 = mk({ id: uuidv4(), type: 'premise', outline_number: '2.1', parent_id: claim.id, title: 'LLMs automate research synthesis', content: 'Modern models can read, summarize and cross-reference large corpora faster than humans.', position: { x: 300, y: 300 } });
-      const p2 = mk({ id: uuidv4(), type: 'premise', outline_number: '2.2', parent_id: claim.id, title: 'Agents execute multi-step tasks', content: 'Tool-using agents can complete workflows end-to-end with minimal supervision.', position: { x: 620, y: 300 } });
-      const obj = mk({ id: uuidv4(), type: 'objection', outline_number: '2.3', parent_id: claim.id, color: 'amber', title: 'Hallucinations limit reliability', content: 'Unpredictable factual errors make full autonomy risky in high-stakes settings.', position: { x: 900, y: 300 } });
+      const claim = mk({ id: uuidv4(), type: 'claim', case_id: caseDoc.id, outline_number: '1', title: 'AI will transform knowledge work', content: 'Large-scale automation of cognitive tasks is imminent and will reshape how professionals work.', position: { x: 520, y: 60 } });
+      const p1 = mk({ id: uuidv4(), type: 'premise', case_id: caseDoc.id, outline_number: '1.1', parent_id: claim.id, title: 'LLMs automate research synthesis', content: 'Modern models can read, summarize and cross-reference large corpora faster than humans.', position: { x: 300, y: 300 } });
+      const p2 = mk({ id: uuidv4(), type: 'premise', case_id: caseDoc.id, outline_number: '1.2', parent_id: claim.id, title: 'Agents execute multi-step tasks', content: 'Tool-using agents can complete workflows end-to-end with minimal supervision.', position: { x: 620, y: 300 } });
+      const obj = mk({ id: uuidv4(), type: 'objection', case_id: caseDoc.id, outline_number: '1.3', parent_id: claim.id, color: 'amber', title: 'Hallucinations limit reliability', content: 'Unpredictable factual errors make full autonomy risky in high-stakes settings.', position: { x: 900, y: 300 } });
       const note1 = mk({ id: uuidv4(), type: 'note', title: 'Reading list', content: 'Key sources on automation. See [[AI will transform knowledge work]] and [[Productivity gains]].', position: { x: 120, y: 560 } });
       const note2 = mk({ id: uuidv4(), type: 'note', title: 'Productivity gains', content: 'Early studies show 20-40% speedups for writing-heavy tasks. Links back to [[Reading list]].', position: { x: 460, y: 560 } });
       const t1 = mk({ id: uuidv4(), type: 'task', status: 'done', title: 'Draft essay outline', content: 'Sketch the main argument.', due_date: null, position: { x: 120, y: 760 } });
-      const t2 = mk({ id: uuidv4(), type: 'task', status: 'in_progress', title: 'Write first section', content: 'Expand premise 2.1.', position: { x: 420, y: 760 } });
-      const t3 = mk({ id: uuidv4(), type: 'task', status: 'todo', title: 'Address objection 2.3', content: 'Add reliability discussion.', position: { x: 720, y: 760 } });
+      const t2 = mk({ id: uuidv4(), type: 'task', status: 'in_progress', title: 'Write first section', content: 'Expand premise 1.1.', position: { x: 420, y: 760 } });
+      const t3 = mk({ id: uuidv4(), type: 'task', status: 'todo', title: 'Address objection 1.3', content: 'Add reliability discussion.', position: { x: 720, y: 760 } });
       const nodes = [claim, p1, p2, obj, note1, note2, t1, t2, t3];
       await db.collection('nodes').insertMany(nodes.map((n) => ({ ...n })));
       const edge = (s, t, relation, extra = {}) => ({ id: uuidv4(), workspace_id: WS, source_id: s, target_id: t, relation, joint_group_id: null, style: relation === 'objects_to' ? 'dashed' : 'solid', ...extra });
@@ -381,7 +701,7 @@ export async function POST(request) {
         edge(t2.id, t3.id, 'follow_up'),
       ];
       await db.collection('edges').insertMany(edges.map((e) => ({ ...e })));
-      return json({ ok: true, nodes: nodes.length, edges: edges.length });
+      return json({ ok: true, case_id: caseDoc.id, nodes: nodes.length, edges: edges.length });
     }
 
     return json({ error: 'Not found' }, 404);
@@ -396,11 +716,25 @@ export async function PUT(request) {
     const parts = segments(request);
     const db = await getDb();
     const body = await request.json().catch(() => ({}));
+    if (parts[0] === 'cases' && parts[1]) {
+      const upd = { ...body, updated_at: new Date().toISOString() };
+      delete upd.id;
+      delete upd._id;
+      delete upd.workspace_id;
+      await db.collection('cases').updateOne({ id: parts[1] }, { $set: upd });
+      const c = await db.collection('cases').findOne({ id: parts[1] });
+      return json(clean(c));
+    }
     if (parts[0] === 'nodes' && parts[1]) {
       const upd = { ...body, updated_at: new Date().toISOString() };
       delete upd.id;
       delete upd._id;
       delete upd.workspace_id;
+      // Structural fields (case_id, parent_id) must stay consistent with
+      // outline_number; only the dedicated edge/detach flows should change
+      // them, not a generic field patch.
+      delete upd.case_id;
+      delete upd.parent_id;
       await db.collection('nodes').updateOne({ id: parts[1] }, { $set: upd });
       const n = await db.collection('nodes').findOne({ id: parts[1] });
       return json(clean(n));
@@ -424,13 +758,35 @@ export async function DELETE(request) {
   try {
     const parts = segments(request);
     const db = await getDb();
+    if (parts[0] === 'cases' && parts[1]) {
+      const nodeIds = (await db.collection('nodes').find({ workspace_id: WS, case_id: parts[1] }).project({ id: 1 }).toArray()).map((n) => n.id);
+      await db.collection('edges').deleteMany({ workspace_id: WS, $or: [{ source_id: { $in: nodeIds } }, { target_id: { $in: nodeIds } }] });
+      await db.collection('nodes').deleteMany({ workspace_id: WS, case_id: parts[1] });
+      await db.collection('cases').deleteOne({ id: parts[1] });
+      return json({ ok: true });
+    }
     if (parts[0] === 'nodes' && parts[1]) {
+      const touchingEdges = await db
+        .collection('edges')
+        .find({ workspace_id: WS, $or: [{ source_id: parts[1] }, { target_id: parts[1] }] })
+        .toArray();
+      const affectedGroups = [...new Set(touchingEdges.map((e) => e.joint_group_id).filter(Boolean))];
+
       await db.collection('nodes').deleteOne({ id: parts[1] });
       await db.collection('edges').deleteMany({ $or: [{ source_id: parts[1] }, { target_id: parts[1] }] });
+
+      // Promote former children to roots instead of leaving them orphaned.
+      const children = await db.collection('nodes').find({ workspace_id: WS, parent_id: parts[1] }).toArray();
+      for (const child of children) await detachNode(db, child);
+
+      for (const gid of affectedGroups) await pruneGroupIfSingleton(db, gid);
+
       return json({ ok: true });
     }
     if (parts[0] === 'edges' && parts[1]) {
+      const edge = await db.collection('edges').findOne({ id: parts[1] });
       await db.collection('edges').deleteOne({ id: parts[1] });
+      if (edge?.joint_group_id) await pruneGroupIfSingleton(db, edge.joint_group_id);
       return json({ ok: true });
     }
     return json({ error: 'Not found' }, 404);

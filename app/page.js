@@ -8,13 +8,19 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogD
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
 import { Toaster } from '@/components/ui/sonner';
-import { Brain, Network, FileText, Share2, ListChecks, Plus, PanelRightClose, PanelRightOpen, Sparkles, Flag, CheckCircle2, AlertTriangle, ListTodo, Search, Wand2, Loader2 } from 'lucide-react';
+import { Brain, Network, FileText, Share2, ListChecks, Plus, PanelRightClose, PanelRightOpen, Sparkles, Flag, CheckCircle2, AlertTriangle, ListTodo, Search, Wand2, Loader2, Target } from 'lucide-react';
 import CanvasView from '@/components/scaffold/CanvasView';
 import GraphView from '@/components/scaffold/GraphView';
 import NotesView from '@/components/scaffold/NotesView';
 import TimelineView from '@/components/scaffold/TimelineView';
 import AIChat from '@/components/scaffold/AIChat';
 import NodeEditor from '@/components/scaffold/NodeEditor';
+import CaseSwitcher from '@/components/scaffold/CaseSwitcher';
+import IntegrityPanel from '@/components/scaffold/IntegrityPanel';
+import WeakSpotsPanel from '@/components/scaffold/WeakSpotsPanel';
+import { findOrphans } from '@/lib/graph';
+
+const ARG_TYPES = ['claim', 'premise', 'objection'];
 
 const api = {
   get: (p) => fetchJSON(`/api/${p}`),
@@ -59,6 +65,8 @@ const ADD_TYPES = [
 function App() {
   const [nodes, setNodes] = useState([]);
   const [edges, setEdges] = useState([]);
+  const [cases, setCases] = useState([]);
+  const [selectedCaseId, setSelectedCaseId] = useState(null);
   const [view, setView] = useState('canvas');
   const [selectedId, setSelectedId] = useState(null);
   const [showAI, setShowAI] = useState(true);
@@ -70,13 +78,15 @@ function App() {
   const [structOpen, setStructOpen] = useState(false);
   const [structText, setStructText] = useState('');
   const [structBusy, setStructBusy] = useState(false);
+  const [integrityOpen, setIntegrityOpen] = useState(false);
+  const [weakSpotsOpen, setWeakSpotsOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const n = await api.get('nodes');
-      const e = await api.get('edges');
+      const [n, e, c] = await Promise.all([api.get('nodes'), api.get('edges'), api.get('cases')]);
       setNodes(Array.isArray(n) ? n : []);
       setEdges(Array.isArray(e) ? e : []);
+      setCases(Array.isArray(c) ? c : []);
     } catch (err) {
       console.error('[sf] refresh error', err && err.message);
     } finally {
@@ -87,6 +97,11 @@ function App() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Default to the first case once cases load, if nothing is selected yet.
+  useEffect(() => {
+    if (!selectedCaseId && cases.length) setSelectedCaseId(cases[0].id);
+  }, [cases, selectedCaseId]);
 
   useEffect(() => {
     const onKey = (e) => {
@@ -105,17 +120,34 @@ function App() {
     if (node.type === 'note') setView('notes');
     else if (node.type === 'task') setView('timeline');
     else {
+      if (node.case_id) setSelectedCaseId(node.case_id);
       setView('canvas');
       setFocusNodeId(null);
       setTimeout(() => setFocusNodeId(node.id), 50);
     }
   }, []);
 
+  const createCase = useCallback(async (title) => {
+    const c = await api.post('cases', { title });
+    if (c?.id) {
+      setCases((prev) => [...prev, c]);
+      setSelectedCaseId(c.id);
+      toast.success('Case created');
+    } else {
+      toast.error(c?.error || 'Could not create case');
+    }
+    return c;
+  }, []);
+
   const runStructure = useCallback(async () => {
     if (!structText.trim()) return;
+    if (!selectedCaseId) {
+      toast.error('Create or select a case first');
+      return;
+    }
     setStructBusy(true);
     try {
-      const res = await api.post('ai/structure', { text: structText });
+      const res = await api.post('ai/structure', { text: structText, case_id: selectedCaseId });
       if (res?.ok) {
         await refresh();
         setView('canvas');
@@ -130,16 +162,30 @@ function App() {
       toast.error('Structure failed: ' + e.message);
     }
     setStructBusy(false);
-  }, [structText, refresh]);
+  }, [structText, selectedCaseId, refresh]);
 
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
 
+  const orphans = useMemo(() => findOrphans(nodes), [nodes]);
+
+  // Canvas shows the active case's argument nodes plus any free-floating
+  // notes/tasks (case_id null) — other cases stay hidden until switched to.
+  const canvasNodes = useMemo(() => nodes.filter((n) => !n.case_id || n.case_id === selectedCaseId), [nodes, selectedCaseId]);
+  const canvasNodeIds = useMemo(() => new Set(canvasNodes.map((n) => n.id)), [canvasNodes]);
+  const canvasEdges = useMemo(() => edges.filter((e) => canvasNodeIds.has(e.source_id) && canvasNodeIds.has(e.target_id)), [edges, canvasNodeIds]);
+
   const createNode = useCallback(async (type, extra = {}) => {
+    if (ARG_TYPES.includes(type) && !extra.parent_id && !extra.case_id) {
+      toast.error('Create or select a case first');
+      return null;
+    }
     const node = await api.post('nodes', { type, ...extra });
     if (node?.id) {
       setNodes((prev) => [...prev, node]);
       setSelectedId(node.id);
       toast.success(`${type} created`);
+    } else {
+      toast.error(node?.error || `Could not create ${type}`);
     }
     return node;
   }, []);
@@ -156,11 +202,10 @@ function App() {
   }, []);
 
   const deleteNode = useCallback(async (id) => {
-    setNodes((prev) => prev.filter((n) => n.id !== id));
-    setEdges((prev) => prev.filter((e) => e.source_id !== id && e.target_id !== id));
-    if (selectedId === id) setSelectedId(null);
     await api.del(`nodes/${id}`);
-  }, [selectedId]);
+    await refresh();
+    if (selectedId === id) setSelectedId(null);
+  }, [selectedId, refresh]);
 
   const createEdge = useCallback(async (payload) => {
     const edge = await api.post('edges', payload);
@@ -168,8 +213,61 @@ function App() {
       setEdges((prev) => [...prev, edge]);
       // if it changed numbering/parent on the source, refresh nodes
       if (payload.relation === 'supports' || payload.relation === 'objects_to') await refresh();
+    } else {
+      toast.error(edge?.error || 'Could not create connection');
     }
     return edge;
+  }, [refresh]);
+
+  const groupEdges = useCallback(async (edgeIds) => {
+    const res = await api.post('edges/group', { edge_ids: edgeIds });
+    if (res?.ok) {
+      await refresh();
+      toast.success('Grouped as joint support');
+    } else {
+      toast.error(res?.error || 'Could not group');
+    }
+  }, [refresh]);
+
+  const ungroupEdge = useCallback(async (edgeId) => {
+    const res = await api.post(`edges/${edgeId}/ungroup`, {});
+    if (res?.ok) {
+      await refresh();
+      toast.success('Split from joint group');
+    } else {
+      toast.error(res?.error || 'Could not split');
+    }
+  }, [refresh]);
+
+  const updateEdgeStrength = useCallback(async (edgeId, strength) => {
+    const res = await api.put(`edges/${edgeId}`, { strength });
+    if (res?.id) {
+      await refresh();
+      toast.success('Strength updated');
+    } else {
+      toast.error(res?.error || 'Could not update strength');
+    }
+  }, [refresh]);
+
+  const tidyCase = useCallback(async () => {
+    if (!selectedCaseId) return;
+    const res = await api.post(`cases/${selectedCaseId}/tidy`);
+    if (res?.ok) {
+      await refresh();
+      toast.success('Tidied');
+    } else {
+      toast.error(res?.error || 'Could not tidy');
+    }
+  }, [selectedCaseId, refresh]);
+
+  const detachOrphan = useCallback(async (id) => {
+    const res = await api.post(`nodes/${id}/detach`, {});
+    if (res?.id) {
+      await refresh();
+      toast.success('Detached as new root');
+    } else {
+      toast.error(res?.error || 'Could not detach');
+    }
   }, [refresh]);
 
   const openEditor = useCallback((id) => {
@@ -182,8 +280,9 @@ function App() {
 
   const seedDemo = async () => {
     setLoading(true);
-    await api.post('seed');
+    const res = await api.post('seed');
     await refresh();
+    if (res?.case_id) setSelectedCaseId(res.case_id);
     toast.success('Demo workspace loaded');
   };
 
@@ -211,6 +310,30 @@ function App() {
   };
 
   const summarizeCluster = useCallback((ids) => api.post('ai/summarize', { node_ids: ids }), []);
+
+  const debateClaim = async (claimNode) => {
+    const res = await api.post('ai/debate', { node_id: claimNode.id, rounds: 2 });
+    if (res?.rounds_completed) {
+      await refresh();
+      toast.success(`Devil's advocate: ${res.rounds_completed} round(s) added`);
+      return res;
+    }
+    toast.error(res?.error || 'Devil\'s advocate failed');
+    return res;
+  };
+
+  const findCrux = async (claimNode) => {
+    const res = await api.post('ai/crux', { node_id: claimNode.id });
+    if (res?.task_id) {
+      await refresh();
+      toast.success('Crux logged as a task');
+      return res;
+    }
+    toast.error(res?.error || 'Could not find the crux');
+    return res;
+  };
+
+  const weakLinks = useCallback(() => api.post('ai/weak-links', { case_id: selectedCaseId }), [selectedCaseId]);
 
   return (
     <div className="h-screen w-screen flex flex-col bg-background text-foreground overflow-hidden">
@@ -240,13 +363,25 @@ function App() {
           ))}
         </nav>
 
+        <div className="ml-2">
+          <CaseSwitcher cases={cases} selectedCaseId={selectedCaseId} onSelect={setSelectedCaseId} onCreate={createCase} />
+        </div>
+
         <div className="ml-auto flex items-center gap-2">
+          {orphans.length > 0 && (
+            <Button variant="ghost" size="sm" onClick={() => setIntegrityOpen(true)} className="text-amber-500 hover:text-amber-500">
+              <AlertTriangle className="h-4 w-4 mr-1" /> {orphans.length} issue{orphans.length === 1 ? '' : 's'}
+            </Button>
+          )}
           <Button variant="ghost" size="sm" onClick={() => setSearchOpen(true)} className="text-muted-foreground">
             <Search className="h-4 w-4 mr-1" /> Search
             <kbd className="ml-2 hidden md:inline text-[10px] bg-muted px-1.5 py-0.5 rounded border border-border">⌘K</kbd>
           </Button>
           <Button variant="outline" size="sm" onClick={() => setStructOpen(true)}>
             <Wand2 className="h-4 w-4 mr-1" /> AI Structure
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setWeakSpotsOpen(true)} disabled={!selectedCaseId}>
+            <Target className="h-4 w-4 mr-1" /> Weak spots
           </Button>
           <Button variant="outline" size="sm" onClick={seedDemo}>
             <Sparkles className="h-4 w-4 mr-1" /> Demo
@@ -259,7 +394,15 @@ function App() {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               {ADD_TYPES.map((t) => (
-                <DropdownMenuItem key={t.type} onClick={() => createNode(t.type, { title: `New ${t.label.toLowerCase()}` })}>
+                <DropdownMenuItem
+                  key={t.type}
+                  onClick={() =>
+                    createNode(t.type, {
+                      title: `New ${t.label.toLowerCase()}`,
+                      ...(ARG_TYPES.includes(t.type) ? { case_id: selectedCaseId } : {}),
+                    })
+                  }
+                >
                   <t.icon className="h-4 w-4 mr-2" /> {t.label}
                 </DropdownMenuItem>
               ))}
@@ -279,12 +422,16 @@ function App() {
           {view === 'canvas' && (
             <div className="h-full" onClickCapture={(e) => { const el = e.target.closest?.('[data-id]'); if (el) onSelectNode(el.getAttribute('data-id')); }}>
               <CanvasView
-                nodes={nodes}
-                edges={edges}
+                nodes={canvasNodes}
+                edges={canvasEdges}
                 onCreateEdge={createEdge}
                 onUpdatePosition={updatePosition}
                 onEditNode={onEditNode}
                 onDeleteNode={deleteNode}
+                onGroupEdges={groupEdges}
+                onUngroupEdge={ungroupEdge}
+                onUpdateEdgeStrength={updateEdgeStrength}
+                onTidy={tidyCase}
                 focusNodeId={focusNodeId}
               />
             </div>
@@ -300,12 +447,28 @@ function App() {
 
         {showAI && (
           <aside className="w-[380px] shrink-0 border-l border-border">
-            <AIChat selectedNode={selectedNode} onAddObjection={addObjectionFromAI} onDraftRebuttal={draftRebuttal} />
+            <AIChat
+              selectedNode={selectedNode}
+              onAddObjection={addObjectionFromAI}
+              onDraftRebuttal={draftRebuttal}
+              onDebate={debateClaim}
+              onFindCrux={findCrux}
+            />
           </aside>
         )}
       </div>
 
       <NodeEditor node={editorNode} open={editorOpen} onOpenChange={setEditorOpen} onSave={updateNode} />
+
+      <IntegrityPanel
+        open={integrityOpen}
+        onOpenChange={setIntegrityOpen}
+        orphans={orphans}
+        onDetach={detachOrphan}
+        onDelete={deleteNode}
+      />
+
+      <WeakSpotsPanel open={weakSpotsOpen} onOpenChange={setWeakSpotsOpen} onLoad={weakLinks} />
 
       <CommandDialog open={searchOpen} onOpenChange={setSearchOpen}>
         <CommandInput placeholder="Search notes, claims, tasks…" />
@@ -333,7 +496,7 @@ function App() {
         <DialogContent className="max-w-xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2"><Wand2 className="h-4 w-4 text-emerald-400" /> AI Auto-Structure</DialogTitle>
-            <DialogDescription>Paste a rough paragraph. The AI extracts a claim, its supporting premises, and any objections — then lays them out on the canvas.</DialogDescription>
+            <DialogDescription>Paste a rough paragraph. The AI extracts a claim, its supporting premises, and any objections — then lays them out on the canvas, in the current case.</DialogDescription>
           </DialogHeader>
           <Textarea
             value={structText}
@@ -343,7 +506,7 @@ function App() {
           />
           <DialogFooter>
             <Button variant="ghost" onClick={() => setStructOpen(false)} disabled={structBusy}>Cancel</Button>
-            <Button onClick={runStructure} disabled={structBusy || !structText.trim()}>
+            <Button onClick={runStructure} disabled={structBusy || !structText.trim() || !selectedCaseId}>
               {structBusy ? <><Loader2 className="h-4 w-4 mr-1 animate-spin" /> Structuring…</> : <>Build argument map</>}
             </Button>
           </DialogFooter>

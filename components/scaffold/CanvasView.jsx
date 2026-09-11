@@ -16,13 +16,16 @@ import {
   getNodesBounds,
   getViewportForBounds,
 } from '@xyflow/react';
+import { toast } from 'sonner';
 import ScaffoldNode from './ScaffoldNode';
 import JointSupportEdge from './JointSupportEdge';
-import { RELATIONS } from './constants';
+import { RELATIONS, STRENGTHS, STRENGTH_WIDTH } from './constants';
+import { detectCycle } from '@/lib/graph';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Image, FileDown } from 'lucide-react';
+import { Label } from '@/components/ui/label';
+import { Image, FileDown, GitMerge, LayoutGrid } from 'lucide-react';
 
 function download(dataUrl, name) {
   const a = document.createElement('a');
@@ -53,19 +56,29 @@ function buildMarkdown(nodes, edges) {
   return lines.join('\n');
 }
 
-function edgeStyle(relation, joint) {
+function edgeStyle(relation, strength) {
   if (relation === 'supports')
-    return { stroke: '#10b981', strokeWidth: joint ? 3.5 : 2.5 };
+    return { stroke: '#10b981', strokeWidth: STRENGTH_WIDTH[strength] || STRENGTH_WIDTH.moderate };
   if (relation === 'objects_to')
     return { stroke: '#9ca3af', strokeWidth: 2, strokeDasharray: '6 4' };
   if (relation === 'follow_up') return { stroke: '#3b82f6', strokeWidth: 2 };
   return { stroke: '#64748b', strokeWidth: 1.5 };
 }
 
-function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDeleteNode, focusNodeId }) {
+function edgeLabel(e) {
+  const base = e.relation.replace('_', ' ');
+  if (e.relation === 'supports' && e.strength && e.strength !== 'moderate') return `${base} · ${e.strength}`;
+  return base;
+}
+
+function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDeleteNode, onGroupEdges, onUngroupEdge, onUpdateEdgeStrength, onTidy, focusNodeId }) {
   const [rfNodes, setRfNodes] = useState([]);
   const [pending, setPending] = useState(null);
   const [relation, setRelation] = useState('supports');
+  const [strength, setStrength] = useState('moderate');
+  const [editingEdge, setEditingEdge] = useState(null);
+  const [editStrength, setEditStrength] = useState('moderate');
+  const [selectedNodeIds, setSelectedNodeIds] = useState([]);
   const { setCenter, getNodes } = useReactFlow();
 
   const exportPng = useCallback(() => {
@@ -118,6 +131,18 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
 
   const onNodesChange = useCallback((chs) => setRfNodes((nds) => applyNodeChanges(chs, nds)), []);
   const onNodeDragStop = useCallback((_e, node) => onUpdatePosition(node.id, node.position), [onUpdatePosition]);
+  const onSelectionChange = useCallback(({ nodes: sel }) => setSelectedNodeIds(sel.map((n) => n.id)), []);
+
+  // Group candidate: 2+ selected nodes that each have their own solo
+  // `supports` edge into the same claim can be merged into one joint group.
+  const groupCandidateEdgeIds = useMemo(() => {
+    if (selectedNodeIds.length < 2) return null;
+    const candidateEdges = selectedNodeIds.map((id) => edges.find((e) => e.relation === 'supports' && e.source_id === id));
+    if (candidateEdges.some((e) => !e)) return null;
+    const targets = new Set(candidateEdges.map((e) => e.target_id));
+    if (targets.size !== 1) return null;
+    return candidateEdges.map((e) => e.id);
+  }, [selectedNodeIds, edges]);
 
   const rfEdges = useMemo(() => {
     const posById = {};
@@ -147,7 +172,7 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
           source: e.source_id,
           target: e.target_id,
           type: 'joint',
-          data: { ...jg, isTrunk },
+          data: { ...jg, isTrunk, strength: e.strength, onUngroup: onUngroupEdge },
           markerEnd: { type: MarkerType.ArrowClosed, color: '#10b981' },
         };
       }
@@ -155,26 +180,57 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
         id: e.id,
         source: e.source_id,
         target: e.target_id,
-        label: e.relation.replace('_', ' '),
+        label: edgeLabel(e),
         labelStyle: { fontSize: 10, fill: '#94a3b8' },
         labelBgStyle: { fill: '#0f172a' },
-        style: edgeStyle(e.relation, e.joint_group_id),
-        markerEnd: { type: MarkerType.ArrowClosed, color: edgeStyle(e.relation, e.joint_group_id).stroke },
+        style: edgeStyle(e.relation, e.strength),
+        markerEnd: { type: MarkerType.ArrowClosed, color: edgeStyle(e.relation, e.strength).stroke },
       };
     });
-  }, [edges, nodes]);
+  }, [edges, nodes, onUngroupEdge]);
 
   const nodeTypes = useMemo(() => ({ scaffold: ScaffoldNode }), []);
   const edgeTypes = useMemo(() => ({ joint: JointSupportEdge }), []);
 
-  const onConnect = useCallback((params) => {
-    setPending(params);
-    setRelation('supports');
-  }, []);
+  const onConnect = useCallback(
+    (params) => {
+      if (detectCycle(edges, params.source, params.target)) {
+        toast.error('Would create a circular argument');
+        return;
+      }
+      setPending(params);
+      setRelation('supports');
+      setStrength('moderate');
+    },
+    [edges]
+  );
 
   const confirmEdge = () => {
-    if (pending) onCreateEdge({ source_id: pending.source, target_id: pending.target, relation });
+    if (pending) {
+      const payload = { source_id: pending.source, target_id: pending.target, relation };
+      if (relation === 'supports') payload.strength = strength;
+      onCreateEdge(payload);
+    }
     setPending(null);
+  };
+
+  const groupSelected = () => {
+    if (groupCandidateEdgeIds) onGroupEdges(groupCandidateEdgeIds);
+  };
+
+  const onEdgeClick = useCallback(
+    (_e, rfEdge) => {
+      const raw = edges.find((e) => e.id === rfEdge.id);
+      if (raw?.relation !== 'supports') return;
+      setEditingEdge(raw);
+      setEditStrength(raw.strength || 'moderate');
+    },
+    [edges]
+  );
+
+  const saveEdgeStrength = () => {
+    if (editingEdge) onUpdateEdgeStrength(editingEdge.id, editStrength);
+    setEditingEdge(null);
   };
 
   return (
@@ -194,6 +250,8 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
         onNodesChange={onNodesChange}
         onNodeDragStop={onNodeDragStop}
         onConnect={onConnect}
+        onSelectionChange={onSelectionChange}
+        onEdgeClick={onEdgeClick}
         fitView
         minZoom={0.2}
         proOptions={{ hideAttribution: true }}
@@ -206,6 +264,14 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
           <Button size="sm" variant="secondary" className="h-7 text-xs shadow" onClick={exportMd}>
             <FileDown className="h-3.5 w-3.5 mr-1" /> Markdown
           </Button>
+          <Button size="sm" variant="secondary" className="h-7 text-xs shadow" onClick={onTidy}>
+            <LayoutGrid className="h-3.5 w-3.5 mr-1" /> Tidy
+          </Button>
+          {groupCandidateEdgeIds && (
+            <Button size="sm" variant="default" className="h-7 text-xs shadow" onClick={groupSelected}>
+              <GitMerge className="h-3.5 w-3.5 mr-1" /> Group as joint support
+            </Button>
+          )}
         </Panel>
         <Controls className="!bg-slate-800 !border-slate-700 [&_button]:!bg-slate-800 [&_button]:!border-slate-700 [&_button]:!fill-slate-300" />
         <MiniMap pannable zoomable className="!bg-slate-900" nodeColor={(n) => (n.data?.type === 'objection' ? '#f59e0b' : n.data?.type === 'task' ? '#3b82f6' : '#e2e8f0')} />
@@ -229,11 +295,54 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
               ))}
             </SelectContent>
           </Select>
+          {relation === 'supports' && (
+            <div>
+              <Label className="text-xs">Strength</Label>
+              <Select value={strength} onValueChange={setStrength}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {STRENGTHS.map((s) => (
+                    <SelectItem key={s.value} value={s.value}>
+                      {s.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
           <DialogFooter>
             <Button variant="ghost" onClick={() => setPending(null)}>
               Cancel
             </Button>
             <Button onClick={confirmEdge}>Create edge</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!editingEdge} onOpenChange={(o) => !o && setEditingEdge(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit support strength</DialogTitle>
+          </DialogHeader>
+          <Select value={editStrength} onValueChange={setEditStrength}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {STRENGTHS.map((s) => (
+                <SelectItem key={s.value} value={s.value}>
+                  {s.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setEditingEdge(null)}>
+              Cancel
+            </Button>
+            <Button onClick={saveEdgeStrength}>Save</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

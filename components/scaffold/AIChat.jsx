@@ -3,10 +3,10 @@
 import { useRef, useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Send, Sparkles, Bug, Loader2, Brain, Shield } from 'lucide-react';
+import { Send, Sparkles, Bug, Loader2, Brain, Shield, BadgeCheck, Swords, Target } from 'lucide-react';
 import Markdown from './Markdown';
 
-export default function AIChat({ selectedNode, onAddObjection, onDraftRebuttal }) {
+export default function AIChat({ selectedNode, onAddObjection, onDraftRebuttal, onDebate, onFindCrux }) {
   const [messages, setMessages] = useState([
     { role: 'assistant', content: "Hi! I'm your workspace memory. Ask me things like *\"what have I written about X\"*, or select a claim and hit **Critique** to find its weakest premise." },
   ]);
@@ -80,6 +80,7 @@ export default function AIChat({ selectedNode, onAddObjection, onDraftRebuttal }
 
   const isArg = selectedNode && ['claim', 'premise', 'objection'].includes(selectedNode.type);
   const isObjection = selectedNode && selectedNode.type === 'objection';
+  const isClaim = selectedNode && selectedNode.type === 'claim';
 
   const rebut = async () => {
     if (!isObjection || loading) return;
@@ -91,6 +92,57 @@ export default function AIChat({ selectedNode, onAddObjection, onDraftRebuttal }
         push({ role: 'assistant', content: `**${res.title}** ${res.outline_number ? `[${res.outline_number}]` : ''}\n\n${res.content}\n\n_Added to the canvas as a counter-premise contesting the objection._` });
       } else {
         push({ role: 'assistant', content: 'Could not draft a rebuttal.' });
+      }
+    } catch (e) {
+      push({ role: 'assistant', content: 'Error: ' + e.message });
+    }
+    setLoading(false);
+  };
+
+  const steelman = async () => {
+    if (!isArg || loading) return;
+    push({ role: 'user', content: `⚖️ Steelman: ${selectedNode.title}` });
+    setLoading(true);
+    try {
+      const res = await fetch('/api/ai/steelman', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ node_id: selectedNode.id }),
+      }).then((r) => r.json());
+      push({ role: 'assistant', content: res.steelman || res.error || 'No response' });
+    } catch (e) {
+      push({ role: 'assistant', content: 'Error: ' + e.message });
+    }
+    setLoading(false);
+  };
+
+  const debate = async () => {
+    if (!isClaim || loading) return;
+    push({ role: 'user', content: `⚔️ Run devil's advocate (2 rounds) on: ${selectedNode.title}` });
+    setLoading(true);
+    try {
+      const res = await onDebate?.(selectedNode);
+      if (res?.rounds_completed) {
+        push({ role: 'assistant', content: `Completed ${res.rounds_completed} round${res.rounds_completed === 1 ? '' : 's'} — each added an objection and a rebuttal to the canvas, nested under the previous round.\n\n_Select the new nodes on the canvas to see them._` });
+      } else {
+        push({ role: 'assistant', content: res?.error || 'Could not run the debate.' });
+      }
+    } catch (e) {
+      push({ role: 'assistant', content: 'Error: ' + e.message });
+    }
+    setLoading(false);
+  };
+
+  const findCrux = async () => {
+    if (!isClaim || loading) return;
+    push({ role: 'user', content: `🎯 Find the crux of: ${selectedNode.title}` });
+    setLoading(true);
+    try {
+      const res = await onFindCrux?.(selectedNode);
+      if (res?.task_id) {
+        push({ role: 'assistant', content: `**${res.question || res.title}**\n\n_Logged as a task: "${res.title}" — see it in the Rundown view._` });
+      } else {
+        push({ role: 'assistant', content: res?.error || 'Could not find the crux.' });
       }
     } catch (e) {
       push({ role: 'assistant', content: 'Error: ' + e.message });
@@ -115,6 +167,15 @@ export default function AIChat({ selectedNode, onAddObjection, onDraftRebuttal }
         </Button>
         <Button size="sm" variant="outline" disabled={!isObjection || loading} onClick={rebut} className="h-7 text-xs">
           <Shield className="h-3 w-3 mr-1" /> Draft rebuttal
+        </Button>
+        <Button size="sm" variant="outline" disabled={!isArg || loading} onClick={steelman} className="h-7 text-xs">
+          <BadgeCheck className="h-3 w-3 mr-1" /> Steelman
+        </Button>
+        <Button size="sm" variant="outline" disabled={!isClaim || loading} onClick={debate} className="h-7 text-xs">
+          <Swords className="h-3 w-3 mr-1" /> Devil&apos;s advocate
+        </Button>
+        <Button size="sm" variant="outline" disabled={!isClaim || loading} onClick={findCrux} className="h-7 text-xs">
+          <Target className="h-3 w-3 mr-1" /> Find crux
         </Button>
       </div>
       {selectedNode ? (
