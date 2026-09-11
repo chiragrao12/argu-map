@@ -36,7 +36,9 @@ export default function ScaffoldNode({ data, selected }) {
     : 'text-slate-700';
 
   return (
-    <div className={`group relative w-56 rounded-lg border px-3 py-2 ${shellClasses(data.type, data.color, selected)}`}>
+    <div
+      className={`group relative w-56 rounded-lg border px-3 py-2 transition-opacity ${shellClasses(data.type, data.color, selected)} ${data.dimmed ? 'opacity-25' : ''}`}
+    >
       <Handle type="target" position={Position.Top} className="!h-2.5 !w-2.5 !bg-slate-400" />
       <div className="flex items-center gap-2 mb-1">
         {data.outline_number && (
@@ -49,6 +51,15 @@ export default function ScaffoldNode({ data, selected }) {
       </div>
       {data.content && (
         <p className="text-[11px] leading-snug opacity-80 line-clamp-3">{data.content}</p>
+      )}
+      {data.tags?.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1">
+          {data.tags.map((t) => (
+            <span key={t} className="rounded bg-slate-900/10 px-1.5 py-0.5 text-[9px] font-medium leading-none">
+              {t}
+            </span>
+          ))}
+        </div>
       )}
       {data.type === 'task' && (
         <div className="mt-1.5 flex items-center gap-2">

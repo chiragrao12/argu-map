@@ -11,13 +11,26 @@ import { STATUS_META } from './constants';
 
 export default function NodeEditor({ node, open, onOpenChange, onSave }) {
   const [form, setForm] = useState({});
+  const [tagsText, setTagsText] = useState('');
 
   useEffect(() => {
-    if (node) setForm({ ...node });
+    if (node) {
+      setForm({ ...node });
+      setTagsText((node.tags || []).join(', '));
+    }
   }, [node?.id, open]);
 
   if (!node) return null;
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+
+  const save = () => {
+    const tags = tagsText
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+    onSave(node.id, { ...form, tags });
+    onOpenChange(false);
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -35,6 +48,10 @@ export default function NodeEditor({ node, open, onOpenChange, onSave }) {
           <div>
             <Label className="text-xs">Content</Label>
             <Textarea value={form.content || ''} onChange={(e) => set('content', e.target.value)} className="min-h-[140px] font-mono text-sm" />
+          </div>
+          <div>
+            <Label className="text-xs">Tags</Label>
+            <Input value={tagsText} onChange={(e) => setTagsText(e.target.value)} placeholder="comma, separated, tags" />
           </div>
           {node.type === 'task' && (
             <div className="flex gap-3">
@@ -70,7 +87,7 @@ export default function NodeEditor({ node, open, onOpenChange, onSave }) {
         </div>
         <DialogFooter>
           <Button variant="ghost" onClick={() => onOpenChange(false)}>Cancel</Button>
-          <Button onClick={() => { onSave(node.id, form); onOpenChange(false); }}>Save</Button>
+          <Button onClick={save}>Save</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

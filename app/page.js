@@ -8,7 +8,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogD
 import { Textarea } from '@/components/ui/textarea';
 import { toast } from 'sonner';
 import { Toaster } from '@/components/ui/sonner';
-import { Brain, Network, FileText, Share2, ListChecks, Plus, PanelRightClose, PanelRightOpen, Sparkles, Flag, CheckCircle2, AlertTriangle, ListTodo, Search, Wand2, Loader2, Target } from 'lucide-react';
+import { Brain, Network, FileText, Share2, ListChecks, Plus, PanelRightClose, PanelRightOpen, Sparkles, Flag, CheckCircle2, AlertTriangle, ListTodo, Search, Wand2, Loader2, Target, LayoutTemplate, History } from 'lucide-react';
 import CanvasView from '@/components/scaffold/CanvasView';
 import GraphView from '@/components/scaffold/GraphView';
 import NotesView from '@/components/scaffold/NotesView';
@@ -18,6 +18,8 @@ import NodeEditor from '@/components/scaffold/NodeEditor';
 import CaseSwitcher from '@/components/scaffold/CaseSwitcher';
 import IntegrityPanel from '@/components/scaffold/IntegrityPanel';
 import WeakSpotsPanel from '@/components/scaffold/WeakSpotsPanel';
+import TemplatePicker from '@/components/scaffold/TemplatePicker';
+import SnapshotPanel from '@/components/scaffold/SnapshotPanel';
 import { findOrphans } from '@/lib/graph';
 
 const ARG_TYPES = ['claim', 'premise', 'objection'];
@@ -80,6 +82,8 @@ function App() {
   const [structBusy, setStructBusy] = useState(false);
   const [integrityOpen, setIntegrityOpen] = useState(false);
   const [weakSpotsOpen, setWeakSpotsOpen] = useState(false);
+  const [templateOpen, setTemplateOpen] = useState(false);
+  const [snapshotsOpen, setSnapshotsOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -335,6 +339,51 @@ function App() {
 
   const weakLinks = useCallback(() => api.post('ai/weak-links', { case_id: selectedCaseId }), [selectedCaseId]);
 
+  const createFromTemplate = async (templateKey, title) => {
+    const res = await api.post(`templates/${templateKey}`, { title });
+    if (res?.case_id) {
+      await refresh();
+      setSelectedCaseId(res.case_id);
+      setView('canvas');
+      toast.success('Case created from template');
+      return true;
+    }
+    if (res?.note_id) {
+      await refresh();
+      setSelectedId(res.note_id);
+      setView('notes');
+      toast.success('Note created from template');
+      return true;
+    }
+    toast.error(res?.error || 'Could not create from template');
+    return false;
+  };
+
+  const listSnapshots = useCallback(() => (selectedCaseId ? api.get(`cases/${selectedCaseId}/snapshots`) : Promise.resolve([])), [selectedCaseId]);
+
+  const saveSnapshot = useCallback(
+    async (label) => {
+      if (!selectedCaseId) return;
+      const res = await api.post(`cases/${selectedCaseId}/snapshots`, { label });
+      if (res?.id) toast.success('Snapshot saved');
+      else toast.error(res?.error || 'Could not save snapshot');
+    },
+    [selectedCaseId]
+  );
+
+  const restoreSnapshot = useCallback(
+    async (snapshotId) => {
+      const res = await api.post(`snapshots/${snapshotId}/restore`);
+      if (res?.ok) {
+        await refresh();
+        toast.success('Restored');
+      } else {
+        toast.error(res?.error || 'Could not restore');
+      }
+    },
+    [refresh]
+  );
+
   return (
     <div className="h-screen w-screen flex flex-col bg-background text-foreground overflow-hidden">
       <Toaster position="top-center" richColors />
@@ -380,8 +429,14 @@ function App() {
           <Button variant="outline" size="sm" onClick={() => setStructOpen(true)}>
             <Wand2 className="h-4 w-4 mr-1" /> AI Structure
           </Button>
+          <Button variant="outline" size="sm" onClick={() => setTemplateOpen(true)}>
+            <LayoutTemplate className="h-4 w-4 mr-1" /> Templates
+          </Button>
           <Button variant="outline" size="sm" onClick={() => setWeakSpotsOpen(true)} disabled={!selectedCaseId}>
             <Target className="h-4 w-4 mr-1" /> Weak spots
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setSnapshotsOpen(true)} disabled={!selectedCaseId}>
+            <History className="h-4 w-4 mr-1" /> History
           </Button>
           <Button variant="outline" size="sm" onClick={seedDemo}>
             <Sparkles className="h-4 w-4 mr-1" /> Demo
@@ -469,6 +524,16 @@ function App() {
       />
 
       <WeakSpotsPanel open={weakSpotsOpen} onOpenChange={setWeakSpotsOpen} onLoad={weakLinks} />
+
+      <TemplatePicker open={templateOpen} onOpenChange={setTemplateOpen} onCreate={createFromTemplate} />
+
+      <SnapshotPanel
+        open={snapshotsOpen}
+        onOpenChange={setSnapshotsOpen}
+        onList={listSnapshots}
+        onSave={saveSnapshot}
+        onRestore={restoreSnapshot}
+      />
 
       <CommandDialog open={searchOpen} onOpenChange={setSearchOpen}>
         <CommandInput placeholder="Search notes, claims, tasks…" />

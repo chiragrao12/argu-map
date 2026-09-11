@@ -66,6 +66,29 @@ async function pruneGroupIfSingleton(db, groupId) {
   }
 }
 
+// Full-copy snapshot of a case's current nodes + their edges.
+async function saveSnapshot(db, caseId, label) {
+  const nodes = await db.collection('nodes').find({ workspace_id: WS, case_id: caseId }).toArray();
+  const nodeIds = nodes.map((n) => n.id);
+  const edges = await db
+    .collection('edges')
+    .find({ workspace_id: WS, source_id: { $in: nodeIds }, target_id: { $in: nodeIds } })
+    .toArray();
+  const snap = {
+    id: uuidv4(),
+    workspace_id: WS,
+    case_id: caseId,
+    label: label || null,
+    created_at: new Date().toISOString(),
+    node_count: nodes.length,
+    edge_count: edges.length,
+    nodes: nodes.map(clean),
+    edges: edges.map(clean),
+  };
+  await db.collection('snapshots').insertOne({ ...snap });
+  return snap;
+}
+
 async function buildArgumentText(db, rootId) {
   const all = await db.collection('nodes').find({ workspace_id: WS }).toArray();
   const edges = await db.collection('edges').find({ workspace_id: WS }).toArray();
@@ -106,7 +129,16 @@ export async function GET(request) {
     const parts = segments(request);
     const db = await getDb();
     if (parts[0] === 'health' || parts.length === 0) return json({ ok: true, service: 'scaffold' });
-    if (parts[0] === 'cases') {
+    if (parts[0] === 'cases' && parts[1] && parts[2] === 'snapshots') {
+      const snaps = await db
+        .collection('snapshots')
+        .find({ workspace_id: WS, case_id: parts[1] })
+        .project({ nodes: 0, edges: 0 })
+        .sort({ created_at: -1 })
+        .toArray();
+      return json(snaps.map(clean));
+    }
+    if (parts[0] === 'cases' && parts.length === 1) {
       const cases = await db.collection('cases').find({ workspace_id: WS }).toArray();
       return json(cases.map(clean));
     }
@@ -158,6 +190,219 @@ export async function POST(request) {
       return json({ ok: true, updated: ops.length });
     }
 
+    if (parts[0] === 'cases' && parts[1] && parts[2] === 'snapshots') {
+      const caseDoc = await db.collection('cases').findOne({ id: parts[1] });
+      if (!caseDoc) return json({ error: 'Case not found' }, 404);
+      const snap = await saveSnapshot(db, parts[1], body.label || null);
+      return json(clean(snap));
+    }
+
+    if (parts[0] === 'snapshots' && parts[1] && parts[2] === 'restore') {
+      const snap = await db.collection('snapshots').findOne({ id: parts[1] });
+      if (!snap) return json({ error: 'Snapshot not found' }, 404);
+      await saveSnapshot(db, snap.case_id, 'Before restore');
+      await db.collection('nodes').deleteMany({ workspace_id: WS, case_id: snap.case_id });
+      await db.collection('edges').deleteMany({
+        workspace_id: WS,
+        $or: [{ source_id: { $in: snap.nodes.map((n) => n.id) } }, { target_id: { $in: snap.nodes.map((n) => n.id) } }],
+      });
+      if (snap.nodes.length) await db.collection('nodes').insertMany(snap.nodes.map((n) => ({ ...n })));
+      if (snap.edges.length) await db.collection('edges').insertMany(snap.edges.map((e) => ({ ...e })));
+      return json({ ok: true, restored_nodes: snap.nodes.length, restored_edges: snap.edges.length });
+    }
+
+    if (parts[0] === 'templates' && parts[1] === 'toulmin') {
+      const title = (body.title || 'Untitled argument').trim();
+      const now = new Date().toISOString();
+      const caseDoc = { id: uuidv4(), workspace_id: WS, title, description: '', created_at: now, updated_at: now };
+      await db.collection('cases').insertOne({ ...caseDoc });
+
+      const mk = (o) => ({
+        workspace_id: WS,
+        content: '',
+        status: null,
+        due_date: null,
+        color: null,
+        tags: [],
+        created_at: now,
+        updated_at: now,
+        ...o,
+      });
+
+      const claim = mk({
+        id: uuidv4(),
+        type: 'claim',
+        title,
+        content: 'State the claim you want to argue for.',
+        case_id: caseDoc.id,
+        parent_id: null,
+        outline_number: await computeOutline(db, null, caseDoc.id),
+        position: { x: 540, y: 60 },
+      });
+      await db.collection('nodes').insertOne({ ...claim });
+
+      const grounds = mk({
+        id: uuidv4(),
+        type: 'premise',
+        title: 'Grounds',
+        content: 'The evidence or facts that support the claim.',
+        case_id: caseDoc.id,
+        parent_id: claim.id,
+        tags: ['grounds'],
+        outline_number: await computeOutline(db, claim.id, caseDoc.id),
+        position: { x: 260, y: 260 },
+      });
+      await db.collection('nodes').insertOne({ ...grounds });
+      await db.collection('edges').insertOne({ id: uuidv4(), workspace_id: WS, source_id: grounds.id, target_id: claim.id, relation: 'supports', joint_group_id: null, style: 'solid' });
+
+      const warrant = mk({
+        id: uuidv4(),
+        type: 'premise',
+        title: 'Warrant',
+        content: 'Why the grounds justify the claim.',
+        case_id: caseDoc.id,
+        parent_id: claim.id,
+        tags: ['warrant'],
+        outline_number: await computeOutline(db, claim.id, caseDoc.id),
+        position: { x: 560, y: 260 },
+      });
+      await db.collection('nodes').insertOne({ ...warrant });
+      await db.collection('edges').insertOne({ id: uuidv4(), workspace_id: WS, source_id: warrant.id, target_id: claim.id, relation: 'supports', joint_group_id: null, style: 'solid' });
+
+      const backing = mk({
+        id: uuidv4(),
+        type: 'premise',
+        title: 'Backing',
+        content: 'Further support for the warrant.',
+        case_id: caseDoc.id,
+        parent_id: warrant.id,
+        tags: ['backing'],
+        outline_number: await computeOutline(db, warrant.id, caseDoc.id),
+        position: { x: 560, y: 420 },
+      });
+      await db.collection('nodes').insertOne({ ...backing });
+      await db.collection('edges').insertOne({ id: uuidv4(), workspace_id: WS, source_id: backing.id, target_id: warrant.id, relation: 'supports', joint_group_id: null, style: 'solid' });
+
+      const rebuttal = mk({
+        id: uuidv4(),
+        type: 'objection',
+        title: 'Rebuttal',
+        content: 'Conditions under which the claim would not hold.',
+        color: 'amber',
+        case_id: caseDoc.id,
+        parent_id: claim.id,
+        tags: ['rebuttal'],
+        outline_number: await computeOutline(db, claim.id, caseDoc.id),
+        position: { x: 860, y: 260 },
+      });
+      await db.collection('nodes').insertOne({ ...rebuttal });
+      await db.collection('edges').insertOne({ id: uuidv4(), workspace_id: WS, source_id: rebuttal.id, target_id: claim.id, relation: 'objects_to', joint_group_id: null, style: 'dashed' });
+
+      return json({ case_id: caseDoc.id });
+    }
+
+    if (parts[0] === 'templates' && parts[1] === 'pro-con') {
+      const title = (body.title || 'Untitled decision').trim();
+      const now = new Date().toISOString();
+      const caseDoc = { id: uuidv4(), workspace_id: WS, title, description: '', created_at: now, updated_at: now };
+      await db.collection('cases').insertOne({ ...caseDoc });
+
+      const mk = (o) => ({
+        workspace_id: WS,
+        content: '',
+        status: null,
+        due_date: null,
+        color: null,
+        tags: [],
+        created_at: now,
+        updated_at: now,
+        ...o,
+      });
+
+      const claim = mk({
+        id: uuidv4(),
+        type: 'claim',
+        title,
+        content: 'State the decision or position you are weighing.',
+        case_id: caseDoc.id,
+        parent_id: null,
+        outline_number: await computeOutline(db, null, caseDoc.id),
+        position: { x: 540, y: 60 },
+      });
+      await db.collection('nodes').insertOne({ ...claim });
+
+      let px = 200;
+      for (let i = 1; i <= 2; i++) {
+        const pro = mk({
+          id: uuidv4(),
+          type: 'premise',
+          title: `Pro ${i}`,
+          content: 'A reason in favor.',
+          case_id: caseDoc.id,
+          parent_id: claim.id,
+          tags: ['pro'],
+          outline_number: await computeOutline(db, claim.id, caseDoc.id),
+          position: { x: px, y: 300 },
+        });
+        await db.collection('nodes').insertOne({ ...pro });
+        await db.collection('edges').insertOne({ id: uuidv4(), workspace_id: WS, source_id: pro.id, target_id: claim.id, relation: 'supports', joint_group_id: null, style: 'solid' });
+        px += 260;
+      }
+      let ox = px + 40;
+      for (let i = 1; i <= 2; i++) {
+        const con = mk({
+          id: uuidv4(),
+          type: 'objection',
+          title: `Con ${i}`,
+          content: 'A reason against.',
+          color: 'amber',
+          case_id: caseDoc.id,
+          parent_id: claim.id,
+          tags: ['con'],
+          outline_number: await computeOutline(db, claim.id, caseDoc.id),
+          position: { x: ox, y: 300 },
+        });
+        await db.collection('nodes').insertOne({ ...con });
+        await db.collection('edges').insertOne({ id: uuidv4(), workspace_id: WS, source_id: con.id, target_id: claim.id, relation: 'objects_to', joint_group_id: null, style: 'dashed' });
+        ox += 260;
+      }
+
+      return json({ case_id: caseDoc.id });
+    }
+
+    if (parts[0] === 'templates' && parts[1] === 'decision-matrix') {
+      const title = (body.title || 'Untitled decision matrix').trim();
+      const now = new Date().toISOString();
+      const table = [
+        `# Decision Matrix: ${title}`,
+        '',
+        '| Option | Cost | Time | Quality | Notes |',
+        '|---|---|---|---|---|',
+        '| Option A |  |  |  |  |',
+        '| Option B |  |  |  |  |',
+        '| Option C |  |  |  |  |',
+      ].join('\n');
+      const note = {
+        id: uuidv4(),
+        workspace_id: WS,
+        title,
+        content: table,
+        type: 'note',
+        status: null,
+        due_date: null,
+        outline_number: null,
+        parent_id: null,
+        case_id: null,
+        position: { x: 120 + Math.random() * 320, y: 120 + Math.random() * 200 },
+        color: null,
+        tags: ['decision-matrix'],
+        created_at: now,
+        updated_at: now,
+      };
+      await db.collection('nodes').insertOne({ ...note });
+      return json({ note_id: note.id });
+    }
+
     if (parts[0] === 'nodes' && parts[1] && parts[2] === 'detach') {
       const node = await db.collection('nodes').findOne({ id: parts[1] });
       if (!node) return json({ error: 'Node not found' }, 404);
@@ -197,6 +442,7 @@ export async function POST(request) {
         case_id,
         position: body.position || { x: 120 + Math.random() * 320, y: 120 + Math.random() * 200 },
         color: body.color || (type === 'objection' ? 'amber' : null),
+        tags: Array.isArray(body.tags) ? body.tags : [],
         created_at: now,
         updated_at: now,
       };
@@ -763,6 +1009,7 @@ export async function DELETE(request) {
       await db.collection('edges').deleteMany({ workspace_id: WS, $or: [{ source_id: { $in: nodeIds } }, { target_id: { $in: nodeIds } }] });
       await db.collection('nodes').deleteMany({ workspace_id: WS, case_id: parts[1] });
       await db.collection('cases').deleteOne({ id: parts[1] });
+      await db.collection('snapshots').deleteMany({ workspace_id: WS, case_id: parts[1] });
       return json({ ok: true });
     }
     if (parts[0] === 'nodes' && parts[1]) {

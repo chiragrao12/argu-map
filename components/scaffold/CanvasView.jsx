@@ -79,7 +79,17 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
   const [editingEdge, setEditingEdge] = useState(null);
   const [editStrength, setEditStrength] = useState('moderate');
   const [selectedNodeIds, setSelectedNodeIds] = useState([]);
+  const [activeTags, setActiveTags] = useState([]);
   const { setCenter, getNodes } = useReactFlow();
+
+  const allTags = useMemo(() => {
+    const set = new Set();
+    nodes.forEach((n) => (n.tags || []).forEach((t) => set.add(t)));
+    return [...set].sort();
+  }, [nodes]);
+
+  const toggleTag = (t) =>
+    setActiveTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
 
   const exportPng = useCallback(() => {
     const flowNodes = getNodes();
@@ -113,9 +123,14 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
       id: n.id,
       type: 'scaffold',
       position: n.position || { x: 0, y: 0 },
-      data: { ...n, onEdit: onEditNode, onDelete: onDeleteNode },
+      data: {
+        ...n,
+        onEdit: onEditNode,
+        onDelete: onDeleteNode,
+        dimmed: activeTags.length > 0 && !(n.tags || []).some((t) => activeTags.includes(t)),
+      },
     }),
-    [onEditNode, onDeleteNode]
+    [onEditNode, onDeleteNode, activeTags]
   );
 
   useEffect(() => {
@@ -273,6 +288,28 @@ function Inner({ nodes, edges, onCreateEdge, onUpdatePosition, onEditNode, onDel
             </Button>
           )}
         </Panel>
+        {allTags.length > 0 && (
+          <Panel position="top-right" className="flex max-w-[280px] flex-wrap justify-end gap-1">
+            {allTags.map((t) => (
+              <button
+                key={t}
+                onClick={() => toggleTag(t)}
+                className={`rounded-full border px-2 py-0.5 text-[10px] shadow ${
+                  activeTags.includes(t)
+                    ? 'border-emerald-400 bg-emerald-500 text-slate-950'
+                    : 'border-slate-600 bg-slate-800 text-slate-300 hover:bg-slate-700'
+                }`}
+              >
+                {t}
+              </button>
+            ))}
+            {activeTags.length > 0 && (
+              <button onClick={() => setActiveTags([])} className="rounded-full border border-slate-600 bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-slate-700">
+                Clear
+              </button>
+            )}
+          </Panel>
+        )}
         <Controls className="!bg-slate-800 !border-slate-700 [&_button]:!bg-slate-800 [&_button]:!border-slate-700 [&_button]:!fill-slate-300" />
         <MiniMap pannable zoomable className="!bg-slate-900" nodeColor={(n) => (n.data?.type === 'objection' ? '#f59e0b' : n.data?.type === 'task' ? '#3b82f6' : '#e2e8f0')} />
       </ReactFlow>
